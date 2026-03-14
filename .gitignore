@@ -1,0 +1,38 @@
+# Создаем .gitignore с нужным содержимым
+@"
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.env
+.venv
+ENV/
+
+# Логи и данные
+logs/
+*.log
+*.pot
+*.pyc
+
+# VS Code
+.vscode/
+*.code-workspace
+
+# IDE
+.idea/
+*.swp
+*.swo
+
+# Системные файлы
+.DS_Store
+Thumbs.db
+
+# Токены и ключи (доп. безопасность)
+*.key
+*.pem
+*.crt
+"@ | Out-File -FilePath .gitignore -Encoding utf8
