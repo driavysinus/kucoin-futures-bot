@@ -96,20 +96,20 @@ class TradingBot:
             "`/orders [SYMBOL]` — активные ордера\n"
             "`/price SYMBOL` — текущая цена\n\n"
             "*Торговля (размер всегда в USDT):*\n"
-            "`/open SYMBOL SIDE USDT PRICE [LEV]`\n"
-            "  → лимитный ордер\n"
-            "  Пример: `/open XBTUSDTM buy 500 26000 20`\n"
-            "  → Long на 500 USDT по цене 26000, плечо 20x\n\n"
-            "`/market SYMBOL SIDE USDT [LEV]`\n"
-            "  → рыночный ордер\n"
-            "  Пример: `/market XBTUSDTM sell 300 10`\n\n"
-            "`/trailing SYMBOL SIDE USDT CALLBACK% ACTIVATE [TRIGGER%] [CLOSE%] [LEV]`\n"
-            "  → трейлинг-стоп + автопорез\n"
-            "  Пример: `/trailing SKYUSDTM buy 9 10 0.45 10 50 3`\n"
-            "  USDT=9, CALLBACK=10%, ACTIVATE=0.45 (цена активации)\n"
-            "  TRIGGER=10% профита → порез CLOSE=50%, плечо 3x\n\n"
-            "`/close SYMBOL [PCT]` — порез позиции\n"
-            "  Пример: `/close XBTUSDTM 50` — закрыть 50%\n\n"
+            "`/open SYMBOL SIDE USDT PRICE [CB%] [TRIG%] [CLOSE%] [LEV]`\n"
+            "  → лимитный ордер на вход\n"
+            "  Пример: `/open SKYUSDTM buy 9 0.0783 10 10 50 3`\n\n"
+            "`/stop SYMBOL SIDE USDT PRICE [CB%] [TRIG%] [CLOSE%] [LEV]`\n"
+            "  → стоп-маркет ордер на вход *заблаговременно*\n"
+            "  buy: активируется когда цена *вырастет* до PRICE\n"
+            "  sell: активируется когда цена *упадёт* до PRICE\n"
+            "  Пример: `/stop SKYUSDTM buy 9 0.0800 10 10 50 3`\n\n"
+            "  Оба ордера после исполнения автоматически:\n"
+            "  🔁 Трейлинг-стоп → ✂️ Порез → 🎯 Безубыток\n\n"
+            "`/trailing SYMBOL SIDE USDT CB% ACTIVATE [TRIG%] [CLOSE%] [LEV]`\n"
+            "  → трейлинг-стоп на уже открытую позицию\n\n"
+            "`/close SYMBOL [PCT%]` — ручной порез позиции\n"
+            "`/market SYMBOL SIDE USDT [LEV]` — рыночный ордер\n\n"
             "*Управление:*\n"
             "`/cancel ORDER_ID` — отмена ордера\n"
             "`/cancelall SYMBOL` — отмена всех ордеров\n"
@@ -186,14 +186,22 @@ class TradingBot:
 
     @restricted
     async def cmd_open(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-        """Usage: /open SYMBOL SIDE USDT PRICE [LEVERAGE]"""
+        """
+        /open SYMBOL SIDE USDT PRICE [SL] [CB%] [TRIG%] [CLOSE%] [LEV]
+        SL — цена стоп-лосса (0 = без стопа)
+        """
         self._chat_ids.add(update.effective_chat.id)
         args = ctx.args
         if len(args) < 4:
             await update.message.reply_text(
-                "❌ Использование: `/open SYMBOL SIDE USDT PRICE [LEV]`\n"
-                "Пример: `/open XBTUSDTM buy 500 26000 20`\n"
-                "  → Long на 500 USDT по цене 26000, плечо 20x",
+                "❌ Использование:\n"
+                "`/open SYMBOL SIDE USDT PRICE [SL] [CB%] [TRIG%] [CLOSE%] [LEV]`\n\n"
+                "Пример:\n"
+                "`/open SKYUSDTM buy 9 0.0783 0.0750 10 10 50 3`\n"
+                "  → Лимитный long по цене `0.0783`\n"
+                "  → Стоп-лосс: `0.0750`\n"
+                "  → Трейлинг-стоп callback `10%`\n"
+                "  → При `+10%` профита → порез `50%` + безубыток",
                 parse_mode=ParseMode.MARKDOWN
             )
             return
@@ -204,14 +212,77 @@ class TradingBot:
                                              parse_mode=ParseMode.MARKDOWN)
             return
         try:
-            usdt_amount = float(args[2])
-            price       = float(args[3])
-            lev         = _parse(args, 4, int, config.DEFAULT_LEVERAGE)
+            usdt_amount   = float(args[2])
+            price         = float(args[3])
+            sl_price      = _parse(args, 4, float, 0.0)
+            callback_rate = _parse(args, 5, float, config.DEFAULT_TRAILING_STOP_PCT)
+            trigger       = _parse(args, 6, float, config.DEFAULT_PROFIT_TRIGGER_PCT)
+            close_pct     = _parse(args, 7, float, config.DEFAULT_PARTIAL_CLOSE_PCT)
+            lev           = _parse(args, 8, int,   config.DEFAULT_LEVERAGE)
+
             self.manager.set_leverage(symbol, lev)
             self.monitor.subscribe_ticker(symbol)
-            await self.manager.place_limit_order(symbol, side, usdt_amount, price, lev)
+
+            await self.manager.place_limit_order(
+                symbol, side, usdt_amount, price,
+                leverage=lev, callback_rate=callback_rate,
+                profit_trigger=trigger, partial_close_pct=close_pct,
+                sl_price=sl_price,
+            )
         except Exception as e:
             await update.message.reply_text(f"❌ Ошибка: {e}")
+
+    @restricted
+    async def cmd_stop_entry(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        """
+        /stop SYMBOL SIDE USDT PRICE [CB%] [TRIG%] [CLOSE%] [LEV]
+        Стоп-маркет ордер на вход — выставляется заблаговременно.
+        buy:  активируется когда цена вырастет до PRICE
+        sell: активируется когда цена упадёт до PRICE
+        """
+        self._chat_ids.add(update.effective_chat.id)
+        args = ctx.args
+        if len(args) < 4:
+            await update.message.reply_text(
+                "❌ Использование:\n"
+                "`/stop SYMBOL SIDE USDT PRICE [CB%] [TRIG%] [CLOSE%] [LEV]`\n\n"
+                "Пример:\n"
+                "`/stop SKYUSDTM buy 9 0.0800 10 10 50 3`\n"
+                "  → Когда цена вырастет до `0.0800` — купить лонг на 9 USDT\n"
+                "  → Трейлинг-стоп callback `10%`\n"
+                "  → При `+10%` профита → порез `50%` + стоп в безубыток\n\n"
+                "`/stop SKYUSDTM sell 9 0.0750 10 10 50 3`\n"
+                "  → Когда цена упадёт до `0.0750` — открыть шорт на 9 USDT",
+                parse_mode=ParseMode.MARKDOWN
+            )
+            return
+        symbol = args[0].upper()
+        side   = args[1].lower()
+        if side not in ("buy", "sell"):
+            await update.message.reply_text("❌ SIDE должен быть `buy` или `sell`",
+                                             parse_mode=ParseMode.MARKDOWN)
+            return
+        try:
+            usdt_amount   = float(args[2])
+            price         = float(args[3])
+            sl_price      = _parse(args, 4, float, 0.0)
+            callback_rate = _parse(args, 5, float, config.DEFAULT_TRAILING_STOP_PCT)
+            trigger       = _parse(args, 6, float, config.DEFAULT_PROFIT_TRIGGER_PCT)
+            close_pct     = _parse(args, 7, float, config.DEFAULT_PARTIAL_CLOSE_PCT)
+            lev           = _parse(args, 8, int,   config.DEFAULT_LEVERAGE)
+
+            self.manager.set_leverage(symbol, lev)
+            self.monitor.subscribe_ticker(symbol)
+
+            await self.manager.place_stop_entry(
+                symbol, side, usdt_amount, price,
+                leverage=lev, callback_rate=callback_rate,
+                profit_trigger=trigger, partial_close_pct=close_pct,
+                sl_price=sl_price,
+            )
+        except Exception as e:
+            await update.message.reply_text(f"❌ Ошибка: {e}")
+
 
     @restricted
     async def cmd_market(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -301,7 +372,7 @@ class TradingBot:
 
             await self.manager.place_trailing_stop(
                 symbol, side, usdt_amount, callback_rate,
-                entry_price=activate_price,
+                activate_price=activate_price,
                 leverage=lev, profit_trigger=trigger, partial_close_pct=close_pct
             )
         except Exception as e:
@@ -404,6 +475,7 @@ class TradingBot:
         app.add_handler(CommandHandler("positions", self.cmd_positions))
         app.add_handler(CommandHandler("orders",    self.cmd_orders))
         app.add_handler(CommandHandler("open",      self.cmd_open))
+        app.add_handler(CommandHandler("stop",      self.cmd_stop_entry))
         app.add_handler(CommandHandler("market",    self.cmd_market))
         app.add_handler(CommandHandler("trailing",  self.cmd_trailing))
         app.add_handler(CommandHandler("close",     self.cmd_close))

@@ -170,8 +170,54 @@ class KuCoinFuturesClient:
             "trailingStop":  True,
             "callbackRate":  float(callback_rate),
             "marginMode":    config.MARGIN_MODE,
+            "reduceOnly":    True,
         }
         logger.info(f"Trailing stop body → {body}")
+        return await self._request("POST", "/api/v1/orders", body=body)
+
+    async def place_stop_market_entry(self, symbol: str, side: str, size: float,
+                                      stop_price: float, stop_direction: str,
+                                      leverage: int) -> dict:
+        """
+        Стоп-маркет ордер на ВХОД в позицию (не reduceOnly).
+        stop_direction: "up"   — активируется когда цена растёт до stop_price (buy)
+                        "down" — активируется когда цена падает до stop_price (sell)
+        """
+        body = {
+            "clientOid":     uuid.uuid4().hex,
+            "symbol":        symbol,
+            "side":          side,
+            "type":          "market",
+            "size":          int(size),
+            "leverage":      str(leverage),
+            "stop":          stop_direction,
+            "stopPriceType": "TP",
+            "stopPrice":     str(stop_price),
+            "marginMode":    config.MARGIN_MODE,
+        }
+        logger.info(f"Stop market entry body → {body}")
+        return await self._request("POST", "/api/v1/orders", body=body)
+
+    async def place_stop_limit_order(self, symbol: str, side: str, size: float,
+                                     stop_price: float, limit_price: float,
+                                     leverage: int) -> dict:
+        """Стоп-лимит ордер — используется для стопа в безубыток."""
+        body = {
+            "clientOid":     uuid.uuid4().hex,
+            "symbol":        symbol,
+            "side":          side,
+            "type":          "limit",
+            "size":          int(size),
+            "price":         str(limit_price),
+            "stop":          "down" if side == "sell" else "up",
+            "stopPriceType": "TP",
+            "stopPrice":     str(stop_price),
+            "leverage":      str(leverage),
+            "timeInForce":   "GTC",
+            "marginMode":    config.MARGIN_MODE,
+            "reduceOnly":    True,
+        }
+        logger.info(f"Stop limit order body → {body}")
         return await self._request("POST", "/api/v1/orders", body=body)
 
     async def cancel_order(self, order_id: str) -> dict:
