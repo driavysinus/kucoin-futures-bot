@@ -18,6 +18,7 @@ DEFAULT_LEVERAGE           = int(os.getenv("DEFAULT_LEVERAGE", 10))
 DEFAULT_PARTIAL_CLOSE_PCT  = float(os.getenv("DEFAULT_PARTIAL_CLOSE_PCT", 50))
 DEFAULT_TRAILING_STOP_PCT  = float(os.getenv("DEFAULT_TRAILING_STOP_PCT", 1.5))
 DEFAULT_PROFIT_TRIGGER_PCT = float(os.getenv("DEFAULT_PROFIT_TRIGGER_PCT", 2.0))
+MARGIN_MODE                = os.getenv("MARGIN_MODE", "CROSS").upper()  # CROSS или ISOLATED
 
 # ── Sanity check ──────────────────────────────────────────────────────────────
 def validate():

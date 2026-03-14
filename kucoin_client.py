@@ -123,6 +123,7 @@ class KuCoinFuturesClient:
                                 price: float, leverage: int,
                                 client_oid: str = None) -> dict:
         body = {
+            "clientOid":   client_oid or uuid.uuid4().hex,
             "symbol":      symbol,
             "side":        side,
             "type":        "limit",
@@ -130,20 +131,20 @@ class KuCoinFuturesClient:
             "size":        int(size),
             "leverage":    str(leverage),
             "timeInForce": "GTC",
+            "marginMode":  config.MARGIN_MODE,
         }
-        if client_oid:
-            body["clientOid"] = client_oid
         return await self._request("POST", "/api/v1/orders", body=body)
 
     async def place_market_order(self, symbol: str, side: str, size: float,
                                  leverage: int) -> dict:
         body = {
-            "clientOid": uuid.uuid4().hex,
-            "symbol":    symbol,
-            "side":      side,
-            "type":      "market",
-            "size":      int(size),
-            "leverage":  str(leverage),
+            "clientOid":  uuid.uuid4().hex,
+            "symbol":     symbol,
+            "side":       side,
+            "type":       "market",
+            "size":       int(size),
+            "leverage":   str(leverage),
+            "marginMode": config.MARGIN_MODE,
         }
         return await self._request("POST", "/api/v1/orders", body=body)
 
@@ -151,13 +152,9 @@ class KuCoinFuturesClient:
                                         size: float, callback_rate: float,
                                         leverage: int,
                                         stop_price: float = None) -> dict:
-        # stopPrice обязателен для KuCoin
-        if stop_price is None or stop_price <= 0:
+        if not stop_price or stop_price <= 0:
             stop_price = await self.get_mark_price(symbol)
 
-        # side = сторона закрытия (sell закрывает long, buy закрывает short)
-        # stop direction: sell-стоп активируется когда цена ПАДАЕТ до stopPrice → "down"
-        #                 buy-стоп  активируется когда цена РАСТЁТ до stopPrice → "up"
         stop_direction = "down" if side == "sell" else "up"
 
         body = {
@@ -172,6 +169,7 @@ class KuCoinFuturesClient:
             "stopPrice":     str(stop_price),
             "trailingStop":  True,
             "callbackRate":  float(callback_rate),
+            "marginMode":    config.MARGIN_MODE,
         }
         logger.info(f"Trailing stop body → {body}")
         return await self._request("POST", "/api/v1/orders", body=body)
