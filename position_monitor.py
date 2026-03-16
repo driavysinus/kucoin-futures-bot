@@ -115,15 +115,22 @@ class FuturesMonitor:
         topic = msg.get("topic", "")
         data  = msg.get("data", {})
 
+        # Логируем все сообщения по ордерам для отладки
         if "/tradeOrders" in topic:
+            logger.info(f"WS tradeOrders: status={data.get('status')} "
+                        f"type={data.get('type')} reason={data.get('reason')} "
+                        f"symbol={data.get('symbol')} orderId={data.get('orderId','')[:16]}")
+
             status = data.get("status")
             otype  = data.get("type")
+            reason = data.get("reason", "")
 
-            if status == "match":
-                # Partial or full fill
+            # Исполнение ордера — любой done кроме cancelled/rejected
+            if status == "done" and reason not in ("cancelledByUser", "rejectCancelled",
+                                                    "liquidation", "closed"):
                 await self._emit("order_filled", data)
 
-            elif status == "done" and data.get("reason") == "filled":
+            elif status == "match":
                 await self._emit("order_filled", data)
 
             elif otype in ("stop", "trailing_stop") and status == "open":

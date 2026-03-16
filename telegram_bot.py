@@ -219,17 +219,19 @@ class TradingBot:
         try:
             usdt_amount = _float(args[2])
             price       = _float(args[3])
-            sl_price    = _float(args[4])
+            sl_price    = _parse(args, 4, float, 0.0)   # 0 = без стопа
             trim_pct    = _parse(args, 5, float, config.DEFAULT_PROFIT_TRIGGER_PCT)
             lev         = _parse(args, 6, int,   config.DEFAULT_LEVERAGE)
 
             self.monitor.subscribe_ticker(symbol)
+            self.manager.set_leverage(symbol, lev)
 
             await self.manager.place_limit_order(
                 symbol, side, usdt_amount, price,
                 sl_price=sl_price, trim_pct=trim_pct, leverage=lev,
             )
         except Exception as e:
+            logger.error(f"cmd_open error: {e}", exc_info=True)
             await update.message.reply_text(f"❌ Ошибка: {e}")
 
     @restricted

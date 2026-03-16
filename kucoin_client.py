@@ -198,6 +198,31 @@ class KuCoinFuturesClient:
         logger.info(f"Stop market entry body → {body}")
         return await self._request("POST", "/api/v1/orders", body=body)
 
+    async def place_stop_market_close(self, symbol: str, side: str, size: float,
+                                      stop_price: float, stop_direction: str,
+                                      leverage: int) -> dict:
+        """
+        Стоп-маркет ордер на ЗАКРЫТИЕ позиции (reduceOnly).
+        Используется для тейк-профита / пореза как реального ордера на бирже.
+        stop_direction: "up"   — активируется когда цена растёт (закрытие шорта)
+                        "down" — активируется когда цена падает (закрытие лонга)
+        """
+        body = {
+            "clientOid":     uuid.uuid4().hex,
+            "symbol":        symbol,
+            "side":          side,
+            "type":          "market",
+            "size":          int(size),
+            "leverage":      str(leverage),
+            "stop":          stop_direction,
+            "stopPriceType": "TP",
+            "stopPrice":     str(stop_price),
+            "marginMode":    config.MARGIN_MODE,
+            "reduceOnly":    True,
+        }
+        logger.info(f"Stop market close body → {body}")
+        return await self._request("POST", "/api/v1/orders", body=body)
+
     async def place_stop_limit_order(self, symbol: str, side: str, size: float,
                                      stop_price: float, limit_price: float,
                                      leverage: int) -> dict:
