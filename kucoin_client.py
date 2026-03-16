@@ -306,3 +306,4 @@ class KuCoinFuturesClient:
 
     async def get_public_ws_token(self) -> dict:
         return await self._request("POST", "/api/v1/bullet-public")
+

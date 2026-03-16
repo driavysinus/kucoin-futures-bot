@@ -237,24 +237,24 @@ class TradingBot:
     @restricted
     async def cmd_stop_entry(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         """
-        /stop SYMBOL SIDE USDT PRICE [CB%] [TRIG%] [CLOSE%] [LEV]
-        Стоп-маркет ордер на вход — выставляется заблаговременно.
-        buy:  активируется когда цена вырастет до PRICE
-        sell: активируется когда цена упадёт до PRICE
+        /stop SYMBOL SIDE USDT PRICE SL TRIG% LEV
+        Стоп-маркет на вход — та же логика что и /open.
+        buy:  вход когда цена вырастет до PRICE
+        sell: вход когда цена упадёт до PRICE
         """
         self._chat_ids.add(update.effective_chat.id)
         args = ctx.args
-        if len(args) < 4:
+        if len(args) < 5:
             await update.message.reply_text(
                 "❌ Использование:\n"
-                "`/stop SYMBOL SIDE USDT PRICE [CB%] [TRIG%] [CLOSE%] [LEV]`\n\n"
+                "`/stop SYMBOL SIDE USDT PRICE SL TRIG% LEV`\n\n"
                 "Пример:\n"
-                "`/stop SKYUSDTM buy 9 0.0800 10 10 50 3`\n"
-                "  → Когда цена вырастет до `0.0800` — купить лонг на 9 USDT\n"
-                "  → Трейлинг-стоп callback `10%`\n"
-                "  → При `+10%` профита → порез `50%` + стоп в безубыток\n\n"
-                "`/stop SKYUSDTM sell 9 0.0750 10 10 50 3`\n"
-                "  → Когда цена упадёт до `0.0750` — открыть шорт на 9 USDT",
+                "`/stop TRUMPUSDTM buy 9 4.10 3.65 1 3`\n"
+                "  → Вход LONG когда цена вырастет до `4.10`\n"
+                "  → Стоп-лосс: `3.65`\n"
+                "  → Тейк 1: 50% при `+1%`, тейк 2: 50% от остатка при ещё `+1%`\n\n"
+                "`/stop TRUMPUSDTM sell 9 3.80 4.10 1 3`\n"
+                "  → Вход SHORT когда цена упадёт до `3.80`",
                 parse_mode=ParseMode.MARKDOWN
             )
             return
@@ -265,22 +265,18 @@ class TradingBot:
                                              parse_mode=ParseMode.MARKDOWN)
             return
         try:
-            usdt_amount   = _float(args[2])
-            price         = _float(args[3])
-            sl_price      = _parse(args, 4, float, 0.0)
-            callback_rate = _parse(args, 5, float, config.DEFAULT_TRAILING_STOP_PCT)
-            trigger       = _parse(args, 6, float, config.DEFAULT_PROFIT_TRIGGER_PCT)
-            close_pct     = _parse(args, 7, float, config.DEFAULT_PARTIAL_CLOSE_PCT)
-            lev           = _parse(args, 8, int,   config.DEFAULT_LEVERAGE)
+            usdt_amount = _float(args[2])
+            price       = _float(args[3])
+            sl_price    = _parse(args, 4, float, 0.0)
+            trim_pct    = _parse(args, 5, float, config.DEFAULT_PROFIT_TRIGGER_PCT)
+            lev         = _parse(args, 6, int,   config.DEFAULT_LEVERAGE)
 
             self.manager.set_leverage(symbol, lev)
             self.monitor.subscribe_ticker(symbol)
 
             await self.manager.place_stop_entry(
                 symbol, side, usdt_amount, price,
-                leverage=lev, callback_rate=callback_rate,
-                profit_trigger=trigger, partial_close_pct=close_pct,
-                sl_price=sl_price,
+                sl_price=sl_price, trim_pct=trim_pct, leverage=lev,
             )
         except Exception as e:
             await update.message.reply_text(f"❌ Ошибка: {e}")
