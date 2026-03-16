@@ -51,9 +51,16 @@ def restricted(func):
 # ── Helper ────────────────────────────────────────────────────────────────────
 def _parse(args: list, idx: int, cast=str, default=None):
     try:
-        return cast(args[idx])
+        val = args[idx]
+        if cast in (float, int):
+            val = val.replace(",", ".")
+        return cast(val)
     except (IndexError, ValueError, TypeError):
         return default
+
+def _float(s: str) -> float:
+    """Парсит float, принимая и точку и запятую как разделитель."""
+    return float(str(s).replace(",", "."))
 
 
 class TradingBot:
@@ -187,21 +194,19 @@ class TradingBot:
     @restricted
     async def cmd_open(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         """
-        /open SYMBOL SIDE USDT PRICE [SL] [CB%] [TRIG%] [CLOSE%] [LEV]
-        SL — цена стоп-лосса (0 = без стопа)
+        /open SYMBOL SIDE USDT PRICE SL TRIM% LEV
         """
         self._chat_ids.add(update.effective_chat.id)
         args = ctx.args
-        if len(args) < 4:
+        if len(args) < 6:
             await update.message.reply_text(
                 "❌ Использование:\n"
-                "`/open SYMBOL SIDE USDT PRICE [SL] [CB%] [TRIG%] [CLOSE%] [LEV]`\n\n"
+                "`/open SYMBOL SIDE USDT PRICE SL TRIM% LEV`\n\n"
                 "Пример:\n"
-                "`/open SKYUSDTM buy 9 0.0783 0.0750 10 10 50 3`\n"
-                "  → Лимитный long по цене `0.0783`\n"
-                "  → Стоп-лосс: `0.0750`\n"
-                "  → Трейлинг-стоп callback `10%`\n"
-                "  → При `+10%` профита → порез `50%` + безубыток",
+                "`/open TRUMPUSDTM buy 9 4.020 3.653 10 3`\n"
+                "  USDT=9 | Цена=4.020 | SL=3.653 | Порез при +10% | Плечо 3x\n\n"
+                "`/open SKYUSDTM sell 9 0.085 0.092 10 5`\n"
+                "  Шорт | Цена=0.085 | SL=0.092 | Порез при +10% | Плечо 5x",
                 parse_mode=ParseMode.MARKDOWN
             )
             return
@@ -212,22 +217,17 @@ class TradingBot:
                                              parse_mode=ParseMode.MARKDOWN)
             return
         try:
-            usdt_amount   = float(args[2])
-            price         = float(args[3])
-            sl_price      = _parse(args, 4, float, 0.0)
-            callback_rate = _parse(args, 5, float, config.DEFAULT_TRAILING_STOP_PCT)
-            trigger       = _parse(args, 6, float, config.DEFAULT_PROFIT_TRIGGER_PCT)
-            close_pct     = _parse(args, 7, float, config.DEFAULT_PARTIAL_CLOSE_PCT)
-            lev           = _parse(args, 8, int,   config.DEFAULT_LEVERAGE)
+            usdt_amount = _float(args[2])
+            price       = _float(args[3])
+            sl_price    = _float(args[4])
+            trim_pct    = _parse(args, 5, float, config.DEFAULT_PROFIT_TRIGGER_PCT)
+            lev         = _parse(args, 6, int,   config.DEFAULT_LEVERAGE)
 
-            self.manager.set_leverage(symbol, lev)
             self.monitor.subscribe_ticker(symbol)
 
             await self.manager.place_limit_order(
                 symbol, side, usdt_amount, price,
-                leverage=lev, callback_rate=callback_rate,
-                profit_trigger=trigger, partial_close_pct=close_pct,
-                sl_price=sl_price,
+                sl_price=sl_price, trim_pct=trim_pct, leverage=lev,
             )
         except Exception as e:
             await update.message.reply_text(f"❌ Ошибка: {e}")
@@ -263,8 +263,8 @@ class TradingBot:
                                              parse_mode=ParseMode.MARKDOWN)
             return
         try:
-            usdt_amount   = float(args[2])
-            price         = float(args[3])
+            usdt_amount   = _float(args[2])
+            price         = _float(args[3])
             sl_price      = _parse(args, 4, float, 0.0)
             callback_rate = _parse(args, 5, float, config.DEFAULT_TRAILING_STOP_PCT)
             trigger       = _parse(args, 6, float, config.DEFAULT_PROFIT_TRIGGER_PCT)
@@ -299,7 +299,7 @@ class TradingBot:
         symbol = args[0].upper()
         side   = args[1].lower()
         try:
-            usdt_amount = float(args[2])
+            usdt_amount = _float(args[2])
             lev         = _parse(args, 3, int, config.DEFAULT_LEVERAGE)
             self.manager.set_leverage(symbol, lev)
             self.monitor.subscribe_ticker(symbol)
@@ -355,9 +355,9 @@ class TradingBot:
                                              parse_mode=ParseMode.MARKDOWN)
             return
         try:
-            usdt_amount    = float(args[2])
-            callback_rate  = float(args[3])
-            activate_price = float(args[4])
+            usdt_amount    = _float(args[2])
+            callback_rate  = _float(args[3])
+            activate_price = _float(args[4])
             trigger        = _parse(args, 5, float, config.DEFAULT_PROFIT_TRIGGER_PCT)
             close_pct      = _parse(args, 6, float, config.DEFAULT_PARTIAL_CLOSE_PCT)
             lev            = _parse(args, 7, int,   config.DEFAULT_LEVERAGE)
