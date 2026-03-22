@@ -102,22 +102,28 @@ class TradingBot:
             "`/positions` — открытые позиции\n"
             "`/orders [SYMBOL]` — активные ордера\n"
             "`/price SYMBOL` — текущая цена\n\n"
-            "*Торговля (размер всегда в USDT):*\n"
-            "`/open SYMBOL SIDE USDT PRICE [CB%] [TRIG%] [CLOSE%] [LEV]`\n"
-            "  → лимитный ордер на вход\n"
-            "  Пример: `/open SKYUSDTM buy 9 0.0783 10 10 50 3`\n\n"
-            "`/stop SYMBOL SIDE USDT PRICE [CB%] [TRIG%] [CLOSE%] [LEV]`\n"
-            "  → стоп-маркет ордер на вход *заблаговременно*\n"
-            "  buy: активируется когда цена *вырастет* до PRICE\n"
-            "  sell: активируется когда цена *упадёт* до PRICE\n"
-            "  Пример: `/stop SKYUSDTM buy 9 0.0800 10 10 50 3`\n\n"
-            "  Оба ордера после исполнения автоматически:\n"
-            "  🔁 Трейлинг-стоп → ✂️ Порез → 🎯 Безубыток\n\n"
-            "`/trailing SYMBOL SIDE USDT CB% ACTIVATE [TRIG%] [CLOSE%] [LEV]`\n"
-            "  → трейлинг-стоп на уже открытую позицию\n\n"
-            "`/close SYMBOL [PCT%]` — ручной порез позиции\n"
-            "`/market SYMBOL SIDE USDT [LEV]` — рыночный ордер\n\n"
+            "*Вход в позицию:*\n"
+            "`/open SYMBOL SIDE USDT PRICE SL TRIG% LEV`\n"
+            "  → лимитный ордер по цене PRICE\n"
+            "  Пример: `/open TRUMPUSDTM buy 9 4.02 3.65 1 3`\n"
+            "  Long 9 USDT @ 4.02 | SL=3.65 | тейки каждые +1% | плечо 3x\n\n"
+            "`/stop SYMBOL SIDE USDT PRICE SL TRIG% LEV`\n"
+            "  → стоп-маркет ордер (вход на пробое цены)\n"
+            "  buy: вход когда цена *вырастет* до PRICE\n"
+            "  sell: вход когда цена *упадёт* до PRICE\n"
+            "  Пример: `/stop TRUMPUSDTM sell 9 3.80 4.10 1 3`\n\n"
+            "*Автологика после исполнения:*\n"
+            "  🛑 Стоп-лосс на SL\n"
+            "  ✂️ Тейк 1: 50% позиции при +TRIG% от входа\n"
+            "     → стоп в безубыток (цена входа)\n"
+            "  ✂️ Тейк 2: 50% остатка при +TRIG% от тейка 1\n"
+            "     → стоп на цену тейка 1\n"
+            "  ✂️ Тейк 3: весь остаток при +TRIG% от тейка 2\n"
+            "     → позиция закрыта полностью 🏁\n\n"
             "*Управление:*\n"
+            "`/close SYMBOL [PCT%]` — ручной порез позиции\n"
+            "  Пример: `/close TRUMPUSDTM 50`\n"
+            "`/market SYMBOL SIDE USDT [LEV]` — рыночный ордер\n"
             "`/cancel ORDER_ID` — отмена ордера\n"
             "`/cancelall SYMBOL` — отмена всех ордеров\n"
             "`/leverage SYMBOL VALUE` — установить плечо\n",
@@ -475,7 +481,6 @@ class TradingBot:
         app.add_handler(CommandHandler("open",      self.cmd_open))
         app.add_handler(CommandHandler("stop",      self.cmd_stop_entry))
         app.add_handler(CommandHandler("market",    self.cmd_market))
-        app.add_handler(CommandHandler("trailing",  self.cmd_trailing))
         app.add_handler(CommandHandler("close",     self.cmd_close))
         app.add_handler(CommandHandler("cancel",    self.cmd_cancel))
         app.add_handler(CommandHandler("cancelall", self.cmd_cancelall))
