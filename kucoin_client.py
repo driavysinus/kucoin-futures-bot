@@ -196,7 +196,21 @@ class KuCoinFuturesClient:
             "marginMode":    config.MARGIN_MODE,
         }
         logger.info(f"Stop market entry body → {body}")
-        return await self._request("POST", "/api/v1/orders", body=body)
+        result = await self._request("POST", "/api/v1/orders", body=body)
+        order_id = result.get("orderId", "")
+
+        # Верифицируем что ордер реально существует на бирже
+        if order_id:
+            import asyncio as _asyncio
+            await _asyncio.sleep(0.5)
+            try:
+                order = await self.get_order(order_id)
+                status = order.get("status", "unknown")
+                logger.info(f"Stop entry verified: {order_id} status={status}")
+            except Exception as e:
+                logger.warning(f"Stop entry order {order_id} not found after placement: {e}")
+
+        return result
 
     async def place_stop_market_close(self, symbol: str, side: str, size: float,
                                       stop_price: float, stop_direction: str,
@@ -253,11 +267,27 @@ class KuCoinFuturesClient:
                                    params={"symbol": symbol})
 
     async def get_open_orders(self, symbol: str = None) -> list:
+        # Обычные активные ордера
         params = {"status": "active"}
         if symbol:
             params["symbol"] = symbol
-        data = await self._request("GET", "/api/v1/orders", params=params)
-        return data.get("items", [])
+        data   = await self._request("GET", "/api/v1/orders", params=params)
+        orders = data.get("items", [])
+        logger.debug(f"Active orders: {len(orders)}")
+
+        # Стоп-ордера — KuCoin хранит их отдельно
+        try:
+            stop_params = {}
+            if symbol:
+                stop_params["symbol"] = symbol
+            stop_data = await self._request("GET", "/api/v1/stopOrders", params=stop_params)
+            stop_items = stop_data.get("items", [])
+            logger.info(f"Stop orders found: {len(stop_items)} — raw: {stop_data}")
+            orders += stop_items
+        except Exception as e:
+            logger.warning(f"stopOrders fetch failed: {e}")
+
+        return orders
 
     async def get_order(self, order_id: str) -> dict:
         return await self._request("GET", f"/api/v1/orders/{order_id}")
@@ -306,4 +336,3 @@ class KuCoinFuturesClient:
 
     async def get_public_ws_token(self) -> dict:
         return await self._request("POST", "/api/v1/bullet-public")
-

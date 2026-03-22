@@ -183,13 +183,30 @@ class TradingBot:
                 await update.message.reply_text("📭 Нет активных ордеров")
                 return
             lines = [f"*📋 Активные ордера{' (' + symbol + ')' if symbol else ''}:*\n"]
-            for o in orders[:15]:   # cap at 15 to avoid message length limit
-                otype = o.get("type", "")
-                label = "🔁 Трейлинг" if "trailing" in otype else "📋 Лимит"
+            for o in orders[:15]:
+                otype      = o.get("type", "")
+                is_stop    = bool(o.get("stop"))
+                is_trail   = "trailing" in str(o.get("trailingStop", ""))
+                reduce     = o.get("reduceOnly", False)
+
+                if is_trail:
+                    label = "🔁 Трейлинг"
+                elif is_stop and reduce:
+                    label = "🎯 Стоп-закрытие"
+                elif is_stop:
+                    label = "🎯 Стоп-вход"
+                else:
+                    label = "📋 Лимит"
+
+                stop_price = o.get("stopPrice", "")
+                price      = o.get("price", "0")
+                show_price = stop_price if is_stop else price
+
+                oid = o.get("id", o.get("orderId", ""))
                 lines.append(
-                    f"{label} `{o.get('id', '')[:12]}…`\n"
+                    f"{label} `{str(oid)[:12]}…`\n"
                     f"  {o.get('symbol')} | {'BUY' if o.get('side')=='buy' else 'SELL'} "
-                    f"| Размер: `{o.get('size')}` | Цена: `{o.get('price', 'Market')}`\n"
+                    f"| Размер: `{o.get('size')}` | Цена: `{show_price}`\n"
                 )
             await update.message.reply_text(
                 "\n".join(lines), parse_mode=ParseMode.MARKDOWN
