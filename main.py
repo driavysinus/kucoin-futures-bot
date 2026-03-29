@@ -6,6 +6,7 @@ import asyncio
 import sys
 from loguru import logger
 from telegram_bot import TradingBot
+from console_input import ConsoleInput
 
 
 def setup_logging():
@@ -30,16 +31,28 @@ async def main():
     logger.info("Starting KuCoin Futures Bot…")
 
     bot = TradingBot()
+
+    # Консольный ввод — передаём все зависимости
+    console = ConsoleInput(
+        alert_manager=bot.alert_manager,
+        order_manager=bot.manager,
+        client=bot.client,
+        monitor=bot.monitor,
+    )
+
     try:
-        await bot.run()
-    except KeyboardInterrupt:
-        logger.info("Bot stopped by user")
-    except Exception as e:
-        logger.exception(f"Fatal error: {e}")
-        sys.exit(1)
+        await asyncio.gather(
+            bot.run(),
+            console.start(),
+        )
+    except (KeyboardInterrupt, asyncio.CancelledError):
+        pass
 
 
 if __name__ == "__main__":
     import os
     os.makedirs("logs", exist_ok=True)
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except (KeyboardInterrupt, SystemExit):
+        pass

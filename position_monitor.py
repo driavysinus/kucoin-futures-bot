@@ -26,6 +26,7 @@ class FuturesMonitor:
         self._ws_public   = None
         self._running     = False
         self._subscribed_tickers: set[str] = set()
+        self._active_subscriptions: set[str] = set()     # уже подписанные на WS
 
     # ── Event bus ─────────────────────────────────────────────────────────────
     def on(self, event: str, handler: Callable):
@@ -53,6 +54,7 @@ class FuturesMonitor:
             await asyncio.gather(
                 self._run_private_ws(),
                 self._run_public_ws(),
+                self._dynamic_subscribe_loop(),
             )
         except asyncio.CancelledError:
             logger.info("Monitor stopped.")
@@ -62,7 +64,52 @@ class FuturesMonitor:
 
     def subscribe_ticker(self, symbol: str):
         """Dynamically add a symbol to price feed."""
+        if symbol in self._subscribed_tickers:
+            return
         self._subscribed_tickers.add(symbol)
+        # Если WS уже живой — подписываем прямо сейчас через asyncio task
+        ws = self._ws_public
+        if ws is not None and symbol not in self._active_subscriptions:
+            asyncio.ensure_future(self._subscribe_single(ws, symbol))
+
+    async def _subscribe_single(self, ws, symbol: str):
+        """Подписать один символ на живой WS."""
+        try:
+            await ws.send(json.dumps({
+                "id":       uuid.uuid4().hex,
+                "type":     "subscribe",
+                "topic":    f"/contractMarket/tickerV2:{symbol}",
+                "response": True,
+            }))
+            self._active_subscriptions.add(symbol)
+            logger.info(f"Live-subscribed to ticker: {symbol}")
+        except Exception as e:
+            logger.warning(f"Live subscribe failed for {symbol}: {e}")
+
+    # ── Dynamic subscription loop ─────────────────────────────────────────────
+    async def _dynamic_subscribe_loop(self):
+        """
+        Fallback: периодически проверяет, есть ли символы без подписки.
+        Нужен на случай если subscribe_ticker был вызван в момент
+        когда WS ещё не был готов или переподключался.
+        """
+        while self._running:
+            try:
+                await asyncio.sleep(2)  # проверяем раз в 2 секунды
+
+                ws = self._ws_public
+                if ws is None:
+                    continue
+
+                new_symbols = self._subscribed_tickers - self._active_subscriptions
+                for symbol in new_symbols:
+                    await self._subscribe_single(ws, symbol)
+                    await asyncio.sleep(0.1)
+
+            except asyncio.CancelledError:
+                return
+            except Exception as e:
+                logger.error(f"Dynamic subscribe loop error: {e}")
 
     # ── Private WebSocket ─────────────────────────────────────────────────────
     async def _run_private_ws(self):
@@ -162,6 +209,8 @@ class FuturesMonitor:
                     if msg.get("type") != "welcome":
                         raise RuntimeError("No welcome from public WS")
 
+                    # При (пере)подключении — сбрасываем active и подписываем заново
+                    self._active_subscriptions.clear()
                     await self._subscribe_tickers(ws)
                     logger.info("Public WS connected & subscribed")
 
@@ -173,6 +222,7 @@ class FuturesMonitor:
                             await self._handle_public_msg(json.loads(raw))
                     finally:
                         ping_task.cancel()
+                        self._active_subscriptions.clear()
 
             except asyncio.CancelledError:
                 raise   # propagate shutdown
@@ -190,6 +240,7 @@ class FuturesMonitor:
                 "topic":    f"/contractMarket/tickerV2:{symbol}",
                 "response": True,
             }))
+            self._active_subscriptions.add(symbol)
             await asyncio.sleep(0.1)
 
     async def _handle_public_msg(self, msg: dict):
@@ -202,9 +253,10 @@ class FuturesMonitor:
                            data.get("price", 0))
             if price > 0:
                 self._price_cache[symbol] = price
-                await self._emit("price_update", {
-                    "symbol": symbol, "price": price, **data
-                })
+                emit_data = dict(data)
+                emit_data["symbol"] = symbol
+                emit_data["price"]  = price
+                await self._emit("price_update", emit_data)
 
     # ── Ping keepalive ────────────────────────────────────────────────────────
     async def _pinger(self, ws, interval: int):

@@ -17,9 +17,16 @@ Commands:
   /cancelall SYMBOL                         — отмена всех ордеров по символу
   /leverage SYMBOL VALUE                    — установить плечо для символа
   /price SYMBOL                             — текущая цена
+  /alert SYMBOL PRICE SIDE USDT [SL] [TRIG%] [LEV] — ценовой алерт
+  /alerts                                   — список активных алертов
+  /rmalert ID                               — удалить алерт
+  /clearalerts [SYMBOL]                     — удалить все алерты
 """
 
 import asyncio
+import json
+import os
+import sys
 from functools import wraps
 from loguru import logger
 
@@ -33,6 +40,7 @@ import config
 from kucoin_client import KuCoinFuturesClient
 from order_manager import OrderManager
 from position_monitor import FuturesMonitor
+from alert_manager import AlertManager
 
 
 # ── Auth decorator ────────────────────────────────────────────────────────────
@@ -63,17 +71,55 @@ def _float(s: str) -> float:
     return float(str(s).replace(",", "."))
 
 
+CHAT_IDS_FILE = "chat_ids.json"
+
+
 class TradingBot:
     def __init__(self):
         self.client  = KuCoinFuturesClient()
         self.monitor = FuturesMonitor(self.client)
         self.manager = OrderManager(self.client, notify=self._broadcast)
+        self.alert_manager = AlertManager(
+            self.manager, self.monitor, notify=self._broadcast
+        )
         self._chat_ids: set[int] = set()
         self._app: Application = None
+        self._load_chat_ids()
+
+    # ── Chat IDs persistence ──────────────────────────────────────────────────
+    def _save_chat_ids(self):
+        try:
+            with open(CHAT_IDS_FILE, "w") as f:
+                json.dump(list(self._chat_ids), f)
+        except Exception as e:
+            logger.error(f"Failed to save chat_ids: {e}")
+
+    def _load_chat_ids(self):
+        if not os.path.exists(CHAT_IDS_FILE):
+            return
+        try:
+            with open(CHAT_IDS_FILE, "r") as f:
+                ids = json.load(f)
+            self._chat_ids = set(ids)
+            if self._chat_ids:
+                logger.info(f"Loaded {len(self._chat_ids)} chat IDs from {CHAT_IDS_FILE}")
+        except Exception as e:
+            logger.error(f"Failed to load chat_ids: {e}")
+
+    def _register_chat(self, update):
+        """Регистрирует чат и сохраняет на диск."""
+        cid = update.effective_chat.id
+        if cid not in self._chat_ids:
+            self._chat_ids.add(cid)
+            self._save_chat_ids()
 
     # ── Broadcast ─────────────────────────────────────────────────────────────
     async def _broadcast(self, text: str):
         if not self._app:
+            logger.warning("Broadcast skipped: _app not initialized")
+            return
+        if not self._chat_ids:
+            logger.warning("Broadcast skipped: no chat IDs (send /start to bot first)")
             return
         for cid in list(self._chat_ids):
             try:
@@ -86,7 +132,7 @@ class TradingBot:
     # ── Commands ──────────────────────────────────────────────────────────────
     @restricted
     async def cmd_start(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-        self._chat_ids.add(update.effective_chat.id)
+        self._register_chat(update)
         await update.message.reply_text(
             "🤖 *KuCoin Futures Bot активирован*\n\n"
             "Введите /help для списка команд.",
@@ -101,7 +147,8 @@ class TradingBot:
             "`/status` — баланс аккаунта\n"
             "`/positions` — открытые позиции\n"
             "`/orders [SYMBOL]` — активные ордера\n"
-            "`/price SYMBOL` — текущая цена\n\n"
+            "`/price SYMBOL` — текущая цена\n"
+            "`/alerts` — активные ценовые алерты\n\n"
             "*Вход в позицию:*\n"
             "`/open SYMBOL SIDE USDT PRICE SL TRIG% LEV`\n"
             "  → лимитный ордер по цене PRICE\n"
@@ -126,13 +173,26 @@ class TradingBot:
             "`/market SYMBOL SIDE USDT [LEV]` — рыночный ордер\n"
             "`/cancel ORDER_ID` — отмена ордера\n"
             "`/cancelall SYMBOL` — отмена всех ордеров\n"
-            "`/leverage SYMBOL VALUE` — установить плечо\n",
+            "`/leverage SYMBOL VALUE` — установить плечо\n\n"
+            "*Ценовые алерты:*\n"
+            "`/alert SYMBOL PRICE SIDE USDT [SL] [TRIG%] [LEV]`\n"
+            "  → мониторинг цены, автооткрытие при достижении\n"
+            "  buy: вход когда цена *опустится* до PRICE\n"
+            "  sell: вход когда цена *вырастет* до PRICE\n"
+            "  Пример: `/alert WIFUSDTM 0.17 sell 9 0.175 2 5`\n"
+            "  Пример: `/alert XBTUSDTM 70000 buy 100 68000 2 10`\n\n"
+            "  После срабатывания — полная автологика тейков\n\n"
+            "`/alerts` — список активных алертов\n"
+            "`/rmalert ID` — удалить алерт\n"
+            "`/clearalerts [SYMBOL]` — удалить все алерты\n\n"
+            "*Экстренное:*\n"
+            "`/kill` — 🛑 форсированная остановка бота",
             parse_mode=ParseMode.MARKDOWN
         )
 
     @restricted
     async def cmd_status(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-        self._chat_ids.add(update.effective_chat.id)
+        self._register_chat(update)
         try:
             acc = await self.client.get_account_overview("USDT")
             await update.message.reply_text(
@@ -148,7 +208,7 @@ class TradingBot:
 
     @restricted
     async def cmd_positions(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-        self._chat_ids.add(update.effective_chat.id)
+        self._register_chat(update)
         try:
             positions = await self.client.get_positions()
             active    = [p for p in positions if float(p.get("currentQty", 0)) != 0]
@@ -175,7 +235,7 @@ class TradingBot:
 
     @restricted
     async def cmd_orders(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-        self._chat_ids.add(update.effective_chat.id)
+        self._register_chat(update)
         symbol = _parse(ctx.args, 0)
         try:
             orders = await self.client.get_open_orders(symbol)
@@ -219,7 +279,7 @@ class TradingBot:
         """
         /open SYMBOL SIDE USDT PRICE SL TRIM% LEV
         """
-        self._chat_ids.add(update.effective_chat.id)
+        self._register_chat(update)
         args = ctx.args
         if len(args) < 6:
             await update.message.reply_text(
@@ -265,7 +325,7 @@ class TradingBot:
         buy:  вход когда цена вырастет до PRICE
         sell: вход когда цена упадёт до PRICE
         """
-        self._chat_ids.add(update.effective_chat.id)
+        self._register_chat(update)
         args = ctx.args
         if len(args) < 5:
             await update.message.reply_text(
@@ -308,7 +368,7 @@ class TradingBot:
     @restricted
     async def cmd_market(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         """Usage: /market SYMBOL SIDE USDT [LEVERAGE]"""
-        self._chat_ids.add(update.effective_chat.id)
+        self._register_chat(update)
         args = ctx.args
         if len(args) < 3:
             await update.message.reply_text(
@@ -348,7 +408,7 @@ class TradingBot:
         Usage: /trailing SYMBOL SIDE USDT CALLBACK ACTIVATE [TRIGGER%] [CLOSE%] [LEV]
         ACTIVATE — цена активации трейлинг-стопа (обязательный параметр)
         """
-        self._chat_ids.add(update.effective_chat.id)
+        self._register_chat(update)
         args = ctx.args
         if len(args) < 5:
             await update.message.reply_text(
@@ -402,7 +462,7 @@ class TradingBot:
     @restricted
     async def cmd_close(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         """Usage: /close SYMBOL [PCT]"""
-        self._chat_ids.add(update.effective_chat.id)
+        self._register_chat(update)
         args = ctx.args
         if not args:
             await update.message.reply_text(
@@ -421,7 +481,7 @@ class TradingBot:
     @restricted
     async def cmd_cancel(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         """Usage: /cancel ORDER_ID"""
-        self._chat_ids.add(update.effective_chat.id)
+        self._register_chat(update)
         if not ctx.args:
             await update.message.reply_text("❌ Использование: `/cancel ORDER_ID`",
                                              parse_mode=ParseMode.MARKDOWN)
@@ -431,7 +491,7 @@ class TradingBot:
     @restricted
     async def cmd_cancelall(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         """Usage: /cancelall SYMBOL"""
-        self._chat_ids.add(update.effective_chat.id)
+        self._register_chat(update)
         if not ctx.args:
             await update.message.reply_text("❌ Использование: `/cancelall SYMBOL`",
                                              parse_mode=ParseMode.MARKDOWN)
@@ -441,7 +501,7 @@ class TradingBot:
     @restricted
     async def cmd_leverage(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         """Usage: /leverage SYMBOL VALUE"""
-        self._chat_ids.add(update.effective_chat.id)
+        self._register_chat(update)
         args = ctx.args
         if len(args) < 2:
             await update.message.reply_text(
@@ -461,7 +521,7 @@ class TradingBot:
     @restricted
     async def cmd_price(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         """Usage: /price SYMBOL"""
-        self._chat_ids.add(update.effective_chat.id)
+        self._register_chat(update)
         if not ctx.args:
             await update.message.reply_text("❌ Использование: `/price SYMBOL`",
                                              parse_mode=ParseMode.MARKDOWN)
@@ -478,6 +538,164 @@ class TradingBot:
             )
         except Exception as e:
             await update.message.reply_text(f"❌ Ошибка: {e}")
+
+    # ── Alerts (Telegram) ─────────────────────────────────────────────────────
+    @restricted
+    async def cmd_alert(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        """
+        /alert SYMBOL PRICE SIDE USDT [SL] [TRIG%] [LEV]
+        Добавить ценовой алерт с автооткрытием позиции.
+        """
+        self._register_chat(update)
+        args = ctx.args
+        if len(args) < 4:
+            await update.message.reply_text(
+                "❌ Использование:\n"
+                "`/alert SYMBOL PRICE SIDE USDT [SL] [TRIG%] [LEV]`\n\n"
+                "Параметры:\n"
+                "  `SYMBOL` — торговая пара\n"
+                "  `PRICE` — цена срабатывания\n"
+                "  `SIDE` — `buy` (long) или `sell` (short)\n"
+                "  `USDT` — размер позиции\n"
+                "  `SL` — стоп-лосс (0 = без)\n"
+                "  `TRIG%` — шаг тейков в %\n"
+                "  `LEV` — плечо\n\n"
+                "Примеры:\n"
+                "`/alert WIFUSDTM 0.17 sell 9 0.175 2 5`\n"
+                "`/alert XBTUSDTM 70000 buy 100 68000 2 10`\n\n"
+                "buy: вход когда цена *опустится* до PRICE\n"
+                "sell: вход когда цена *вырастет* до PRICE",
+                parse_mode=ParseMode.MARKDOWN
+            )
+            return
+
+        try:
+            symbol      = args[0].upper()
+            # Нормализация символа
+            if symbol.endswith("USDTM"):
+                pass
+            elif symbol.endswith("USDT"):
+                symbol += "M"
+            else:
+                symbol += "USDTM"
+
+            price       = _float(args[1])
+            side        = args[2].lower()
+            usdt_amount = _float(args[3])
+
+            if side not in ("buy", "sell"):
+                await update.message.reply_text("❌ SIDE должен быть `buy` или `sell`",
+                                                 parse_mode=ParseMode.MARKDOWN)
+                return
+
+            sl_price = _parse(args, 4, float, 0.0)
+            trim_pct = _parse(args, 5, float, None)
+            leverage = _parse(args, 6, int, None)
+
+            alert = self.alert_manager.add_alert(
+                symbol=symbol,
+                trigger_price=price,
+                side=side,
+                usdt_amount=usdt_amount,
+                sl_price=sl_price,
+                trim_pct=trim_pct,
+                leverage=leverage,
+            )
+
+            direction = "📉 цена ≤" if side == "buy" else "📈 цена ≥"
+            sl_str = f"\n🛑 Стоп-лосс: `{sl_price}`" if sl_price > 0 else ""
+            await update.message.reply_text(
+                f"✅ *Алерт #{alert.id} добавлен*\n"
+                f"Символ: `{alert.symbol}`\n"
+                f"Направление: `{'LONG 📈' if side=='buy' else 'SHORT 📉'}`\n"
+                f"Триггер: {direction} `{price}`\n"
+                f"Объём: `{usdt_amount} USDT` | Плечо: `{alert.leverage}x`{sl_str}\n"
+                f"Тейки каждые `+{alert.trim_pct}%`\n\n"
+                f"_Мониторинг запущен. При достижении цены — автооткрытие._",
+                parse_mode=ParseMode.MARKDOWN
+            )
+        except Exception as e:
+            await update.message.reply_text(f"❌ Ошибка: {e}")
+
+    @restricted
+    async def cmd_rmalert(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        """Usage: /rmalert ID — удалить алерт"""
+        self._register_chat(update)
+        if not ctx.args:
+            await update.message.reply_text("❌ Использование: `/rmalert ID`",
+                                             parse_mode=ParseMode.MARKDOWN)
+            return
+        try:
+            alert_id = int(ctx.args[0])
+            removed = self.alert_manager.remove_alert(alert_id)
+            if removed:
+                await update.message.reply_text(
+                    f"🗑 Алерт #{alert_id} удалён\n"
+                    f"`{removed.symbol}` {removed.side} @ `{removed.trigger_price}`",
+                    parse_mode=ParseMode.MARKDOWN
+                )
+            else:
+                await update.message.reply_text(f"❌ Алерт #{alert_id} не найден")
+        except ValueError:
+            await update.message.reply_text("❌ ID должен быть числом")
+
+    @restricted
+    async def cmd_clearalerts(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        """Usage: /clearalerts [SYMBOL] — удалить все алерты"""
+        self._register_chat(update)
+        symbol = ctx.args[0].upper() if ctx.args else None
+        before = len(self.alert_manager.list_alerts())
+        self.alert_manager.clear_alerts(symbol)
+        after = len(self.alert_manager.list_alerts())
+        removed = before - after
+        suffix = f" по `{symbol}`" if symbol else ""
+        await update.message.reply_text(
+            f"🗑 Удалено алертов: {removed}{suffix}",
+            parse_mode=ParseMode.MARKDOWN
+        )
+
+    @restricted
+    async def cmd_alerts(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        """Usage: /alerts — показать активные ценовые алерты"""
+        self._register_chat(update)
+        alerts = self.alert_manager.list_alerts()
+        if not alerts:
+            await update.message.reply_text("📭 Нет активных алертов\n"
+                                             "Добавьте: `/alert SYMBOL PRICE SIDE USDT [SL] [TRIG%] [LEV]`",
+                                             parse_mode=ParseMode.MARKDOWN)
+            return
+
+        lines = [f"*🔔 Активные алерты ({len(alerts)}):*\n"]
+        for a in alerts:
+            direction = "📉 цена ≤" if a.side == "buy" else "📈 цена ≥"
+            sl_str   = f" | SL: `{a.sl_price}`" if a.sl_price > 0 else ""
+            lines.append(
+                f"*#{a.id}* `{a.symbol}` {a.side.upper()}\n"
+                f"  Триггер: {direction} `{a.trigger_price}`\n"
+                f"  Объём: `{a.usdt_amount} USDT` | Плечо: `{a.leverage}x`{sl_str}\n"
+                f"  Тейки каждые `+{a.trim_pct}%`\n"
+            )
+        await update.message.reply_text(
+            "\n".join(lines), parse_mode=ParseMode.MARKDOWN
+        )
+
+    # ── Kill (emergency stop) ────────────────────────────────────────────────
+    @restricted
+    async def cmd_kill(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        """Usage: /kill — форсированная остановка бота"""
+        self._register_chat(update)
+        await update.message.reply_text(
+            "🛑 *Бот останавливается…*\n"
+            "Все алерты сохранены. Активные ордера на бирже остаются.",
+            parse_mode=ParseMode.MARKDOWN
+        )
+        logger.info("Kill command received from Telegram — shutting down")
+
+        # Останавливаем монитор → это завершит run() → main() выйдет
+        await self.monitor.stop()
+
+        # Принудительный выход через 3 секунды если не завершился
+        asyncio.get_event_loop().call_later(3, lambda: os._exit(0))
 
     # ── Unknown command ───────────────────────────────────────────────────────
     async def cmd_unknown(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -498,11 +716,17 @@ class TradingBot:
         app.add_handler(CommandHandler("open",      self.cmd_open))
         app.add_handler(CommandHandler("stop",      self.cmd_stop_entry))
         app.add_handler(CommandHandler("market",    self.cmd_market))
+        app.add_handler(CommandHandler("trailing",  self.cmd_trailing))
         app.add_handler(CommandHandler("close",     self.cmd_close))
         app.add_handler(CommandHandler("cancel",    self.cmd_cancel))
         app.add_handler(CommandHandler("cancelall", self.cmd_cancelall))
         app.add_handler(CommandHandler("leverage",  self.cmd_leverage))
         app.add_handler(CommandHandler("price",     self.cmd_price))
+        app.add_handler(CommandHandler("alert",     self.cmd_alert))
+        app.add_handler(CommandHandler("alerts",    self.cmd_alerts))
+        app.add_handler(CommandHandler("rmalert",   self.cmd_rmalert))
+        app.add_handler(CommandHandler("clearalerts", self.cmd_clearalerts))
+        app.add_handler(CommandHandler("kill",       self.cmd_kill))
         app.add_handler(MessageHandler(filters.COMMAND, self.cmd_unknown))
 
         return app
@@ -517,19 +741,40 @@ class TradingBot:
         self.monitor.on("position_opened",       self.manager.on_position_opened)
         self.monitor.on("price_update",          self.manager.on_price_update)
 
+        # Wire up monitor events → alert manager (ценовые алерты)
+        self.monitor.on("price_update",          self.alert_manager.on_price_update)
+
         app = self.build()
 
-        async with app:
-            await app.initialize()
-            await app.start()
-            await app.updater.start_polling(drop_pending_updates=True)
-            logger.info("Telegram bot started")
+        await app.initialize()
+        await app.start()
+        await app.updater.start_polling(drop_pending_updates=True)
+        logger.info("Telegram bot started")
 
-            # Run WS monitor alongside
+        try:
+            await self.monitor.start()
+        except (asyncio.CancelledError, KeyboardInterrupt):
+            logger.info("Shutting down…")
+        finally:
+            # Корректное завершение в правильном порядке
             try:
-                await self.monitor.start()
-            finally:
+                await self.monitor.stop()
+            except Exception:
+                pass
+            try:
                 await app.updater.stop()
+            except Exception:
+                pass
+            try:
                 await app.stop()
+            except Exception:
+                pass
+            try:
                 await app.shutdown()
+            except Exception:
+                pass
+            try:
                 await self.client.close()
+            except Exception:
+                pass
+            logger.info("Bot shutdown complete")

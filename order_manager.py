@@ -168,15 +168,86 @@ class OrderManager:
         return order_id
 
     # ─────────────────────────────────────────────────────────────────────────
+    # ШАГ 1в: Маркет-ордер с планом (для алертов)
+    # Вход по рынку + полная автологика тейков/SL/безубытка
+    # ─────────────────────────────────────────────────────────────────────────
+    async def place_market_with_plan(self, symbol: str, side: str,
+                                     usdt_amount: float, sl_price: float,
+                                     trim_pct: float, leverage: int) -> str:
+        """
+        Рыночный ордер + создание плана для автоматических тейков/SL.
+        Вызывается из AlertManager при срабатывании ценового алерта.
+        Та же логика что и place_limit_order / place_stop_entry,
+        но вход по рынку — on_order_filled подхватит и выставит тейки.
+        """
+        # Отменяем старый план если есть
+        old = self._plans.get(symbol)
+        if old:
+            for oid in [old.sl_order_id, old.take_order_id,
+                        old.take2_order_id, old.take3_order_id]:
+                if oid:
+                    try:
+                        await self.client.cancel_order(oid)
+                    except Exception as e:
+                        logger.warning(f"Could not cancel old order {oid}: {e}")
+
+        contracts, price, multiplier = await self.client.usdt_to_contracts(
+            symbol, usdt_amount
+        )
+        actual_usdt = contracts * price * multiplier
+
+        data     = await self.client.place_market_order(
+            symbol, side, contracts, leverage
+        )
+        order_id = data.get("orderId", "")
+
+        # Создаём план — on_order_filled подхватит по entry_order_id
+        self._plans[symbol] = Plan(
+            symbol=symbol, side=side,
+            entry_price=price,   # будет уточнена из позиции в on_order_filled
+            contracts=contracts,
+            sl_price=sl_price, trim_pct=trim_pct,
+            leverage=leverage, entry_order_id=order_id,
+        )
+
+        sl_line = f"\n  🛑 Стоп-лосс: `{sl_price}`" if sl_price > 0 else ""
+        logger.info(f"Market with plan: {symbol} {side} {contracts}c "
+                    f"SL={sl_price} trim={trim_pct}% → {order_id}")
+        await self._send(
+            f"📋 *Маркет-ордер с планом (алерт)*\n"
+            f"Символ: `{symbol}`\n"
+            f"Направление: `{'LONG 📈' if side=='buy' else 'SHORT 📉'}`\n"
+            f"Размер: `{actual_usdt:.2f} USDT` → `{contracts}` контрактов\n"
+            f"Плечо: `{leverage}x`\n"
+            f"После исполнения:{sl_line}\n"
+            f"  ✂️ Тейк 1: 50% при `+{trim_pct}%`\n"
+            f"  ✂️ Тейк 2: 50% от остатка при ещё `+{trim_pct}%`\n"
+            f"  🎯 Безубыток и перенос стопа автоматически\n"
+            f"ID: `{order_id}`"
+        )
+        return order_id
+
+    # ─────────────────────────────────────────────────────────────────────────
     # ШАГ 2: после исполнения лимитки — выставляем тейк и SL
     # ─────────────────────────────────────────────────────────────────────────
     async def _on_entry_filled(self, plan: Plan, fill_price: float):
         plan.entry_price = fill_price
         close_side  = "sell" if plan.side == "buy" else "buy"
-        half        = max(1, plan.contracts // 2)
 
         logger.info(f"_on_entry_filled: symbol={plan.symbol} side={plan.side} "
-                    f"fill={fill_price} sl={plan.sl_price} trim={plan.trim_pct}%")
+                    f"fill={fill_price} sl={plan.sl_price} trim={plan.trim_pct}% "
+                    f"contracts={plan.contracts}")
+
+        # При 1 контракте порез невозможен — ставим только SL, тейк на весь объём
+        if plan.contracts <= 1:
+            half = 1
+            await self._send(
+                f"⚠️ *Позиция слишком мала для пореза*\n"
+                f"Символ: `{plan.symbol}` — всего `{plan.contracts}` контракт(ов)\n"
+                f"Тейк будет на весь объём (без пореза 50%)"
+            )
+        else:
+            half = plan.contracts // 2
 
         # Цена тейка: лонг → выше на trim_pct%, шорт → ниже
         if plan.side == "buy":
@@ -488,7 +559,7 @@ class OrderManager:
                 return False
             return a == b or a.startswith(b) or b.startswith(a)
 
-        # Лимитный/стоп-маркет вход исполнился → тейки + SL
+        # Лимитный/стоп-маркет/маркет вход исполнился → тейки + SL
         if ids_match(plan.entry_order_id, order_id) and not plan.filled:
             plan.filled = True
             # Берём реальную цену входа из позиции (точнее чем WS событие)
