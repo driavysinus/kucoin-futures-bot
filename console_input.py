@@ -134,7 +134,7 @@ class ConsoleInput:
             trim_pct = float(args[5].replace(",", ".")) if len(args) > 5 else None
             leverage = int(args[6])                      if len(args) > 6 else None
 
-            alert = self.alert_manager.add_alert(
+            alert = await self.alert_manager.add_alert(
                 symbol=symbol,
                 trigger_price=price,
                 side=side,
@@ -144,7 +144,7 @@ class ConsoleInput:
                 leverage=leverage,
             )
 
-            direction_emoji = "📉 цена ≤" if side == "buy" else "📈 цена ≥"
+            direction_emoji = "📉 ждём падения до" if alert.direction == "down" else "📈 ждём роста до"
             sl_str = f" | SL={sl_price}" if sl_price > 0 else ""
             print(
                 f"  ✅ Алерт #{alert.id} добавлен\n"

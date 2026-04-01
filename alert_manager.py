@@ -32,24 +32,20 @@ class Alert:
     leverage:    int
     fired:       bool = False
 
-    # Для определения направления пересечения:
-    #   buy  (long)  — цена упала ДО trigger_price или ниже → вход
-    #   sell (short) — цена выросла ДО trigger_price или выше → вход
+    # Направление ожидания цены:
+    #   "down" — ждём когда цена УПАДЁТ до trigger_price (price <= trigger)
+    #   "up"   — ждём когда цена ВЫРАСТЕТ до trigger_price (price >= trigger)
     #
-    # Но пользователь может хотеть и обратную логику (вход на пробое):
-    #   buy  на пробое вверх — цена >= trigger
-    #   sell на пробое вниз  — цена <= trigger
+    # Определяется автоматически при создании алерта:
+    #   trigger < текущая цена → direction = "down" (ждём падения)
+    #   trigger > текущая цена → direction = "up"   (ждём роста)
     #
-    # Используем простую логику:
-    #   buy:  срабатывает когда цена <= trigger_price  (покупаем на уровне/ниже)
-    #   sell: срабатывает когда цена >= trigger_price  (продаём на уровне/выше)
-    #
-    # Для пробойных входов (buy при росте) — используйте /stop команду.
-    direction: str = ""       # "down" для buy, "up" для sell — задаётся автоматически
-
-    def __post_init__(self):
-        if not self.direction:
-            self.direction = "down" if self.side == "buy" else "up"
+    # Это позволяет:
+    #   buy  при падении до уровня (лонг на поддержке)
+    #   buy  при росте до уровня   (лонг на пробое сопротивления)
+    #   sell при росте до уровня   (шорт на сопротивлении)
+    #   sell при падении до уровня (шорт на пробое поддержки)
+    direction: str = ""       # "down" или "up" — задаётся в add_alert
 
 
 class AlertManager:
@@ -109,6 +105,9 @@ class AlertManager:
                     fired=False,
                     direction=item.get("direction", ""),
                 )
+                # Fallback для старых алертов без direction
+                if not alert.direction:
+                    alert.direction = "down" if alert.side == "buy" else "up"
                 self._alerts[alert.id] = alert
                 # Подписаться на тикер
                 self.monitor.subscribe_ticker(alert.symbol)
@@ -130,11 +129,39 @@ class AlertManager:
 
     # ── Управление алертами ──────────────────────────────────────────────────
 
-    def add_alert(self, symbol: str, trigger_price: float, side: str,
-                  usdt_amount: float, sl_price: float = 0.0,
-                  trim_pct: float = None, leverage: int = None) -> Alert:
-        """Добавить ценовой алерт. Возвращает созданный Alert."""
+    async def add_alert(self, symbol: str, trigger_price: float, side: str,
+                        usdt_amount: float, sl_price: float = 0.0,
+                        trim_pct: float = None, leverage: int = None) -> Alert:
+        """Добавить ценовой алерт. Проверяет контракт и определяет направление."""
         from config import DEFAULT_PROFIT_TRIGGER_PCT, DEFAULT_LEVERAGE
+
+        # Проверяем что фьючерсная пара существует на KuCoin
+        try:
+            info = await self.order_manager.client.get_contract_info(symbol)
+            if not info or not info.get("symbol"):
+                raise ValueError(f"Контракт `{symbol}` не найден на KuCoin Futures")
+            logger.info(f"Contract verified: {symbol} (multiplier={info.get('multiplier')})")
+        except RuntimeError as e:
+            raise ValueError(f"Контракт `{symbol}` не существует на KuCoin Futures: {e}")
+
+        # Получаем текущую цену для определения направления
+        try:
+            current_price = await self.order_manager.client.get_mark_price(symbol)
+        except Exception:
+            current_price = 0
+
+        # Определяем направление автоматически
+        if current_price > 0:
+            if trigger_price < current_price:
+                direction = "down"  # ждём падения
+            elif trigger_price > current_price:
+                direction = "up"    # ждём роста
+            else:
+                # Цена уже на уровне — определяем по side
+                direction = "down" if side == "buy" else "up"
+        else:
+            # Не удалось получить цену — fallback по side
+            direction = "down" if side == "buy" else "up"
 
         alert = Alert(
             id=self._next_id,
@@ -145,6 +172,7 @@ class AlertManager:
             sl_price=sl_price,
             trim_pct=trim_pct if trim_pct is not None else DEFAULT_PROFIT_TRIGGER_PCT,
             leverage=leverage if leverage is not None else DEFAULT_LEVERAGE,
+            direction=direction,
         )
         self._alerts[self._next_id] = alert
         self._next_id += 1
@@ -152,7 +180,10 @@ class AlertManager:
         # Подписаться на тикер этого символа
         self.monitor.subscribe_ticker(symbol)
 
+        dir_label = "📉 ждём падения" if direction == "down" else "📈 ждём роста"
+        price_str = f" (текущая: {current_price})" if current_price > 0 else ""
         logger.info(f"Alert #{alert.id} added: {symbol} {side} @ {trigger_price} "
+                    f"direction={direction}{price_str} "
                     f"USDT={usdt_amount} SL={sl_price} trim={alert.trim_pct}% lev={alert.leverage}x")
         self._save_alerts()
         return alert
@@ -187,10 +218,9 @@ class AlertManager:
         Вызывается из FuturesMonitor на каждый price_update.
         Проверяет все алерты для данного символа.
 
-        Логика срабатывания (без ожидания пересечения):
-          buy:  цена <= trigger_price  → вход в лонг
-          sell: цена >= trigger_price  → вход в шорт
-        Срабатывает сразу на первом же тике, если цена уже на уровне.
+        Логика срабатывания по direction (определяется при создании):
+          direction="down" → ждём price <= trigger_price (цена падает до уровня)
+          direction="up"   → ждём price >= trigger_price (цена растёт до уровня)
         """
         symbol = data.get("symbol", "")
         price  = data.get("price", 0)
@@ -207,9 +237,9 @@ class AlertManager:
         for alert in relevant:
             triggered = False
 
-            if alert.side == "buy" and price <= alert.trigger_price:
+            if alert.direction == "down" and price <= alert.trigger_price:
                 triggered = True
-            elif alert.side == "sell" and price >= alert.trigger_price:
+            elif alert.direction == "up" and price >= alert.trigger_price:
                 triggered = True
 
             if triggered:

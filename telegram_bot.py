@@ -592,7 +592,7 @@ class TradingBot:
             trim_pct = _parse(args, 5, float, None)
             leverage = _parse(args, 6, int, None)
 
-            alert = self.alert_manager.add_alert(
+            alert = await self.alert_manager.add_alert(
                 symbol=symbol,
                 trigger_price=price,
                 side=side,
@@ -602,7 +602,7 @@ class TradingBot:
                 leverage=leverage,
             )
 
-            direction = "📉 цена ≤" if side == "buy" else "📈 цена ≥"
+            direction = "📉 ждём падения до" if alert.direction == "down" else "📈 ждём роста до"
             sl_str = f"\n🛑 Стоп-лосс: `{sl_price}`" if sl_price > 0 else ""
             await update.message.reply_text(
                 f"✅ *Алерт #{alert.id} добавлен*\n"
@@ -667,7 +667,7 @@ class TradingBot:
 
         lines = [f"*🔔 Активные алерты ({len(alerts)}):*\n"]
         for a in alerts:
-            direction = "📉 цена ≤" if a.side == "buy" else "📈 цена ≥"
+            direction = "📉 падение до" if a.direction == "down" else "📈 рост до"
             sl_str   = f" | SL: `{a.sl_price}`" if a.sl_price > 0 else ""
             lines.append(
                 f"*#{a.id}* `{a.symbol}` {a.side.upper()}\n"
