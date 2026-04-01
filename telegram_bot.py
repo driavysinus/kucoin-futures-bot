@@ -185,6 +185,9 @@ class TradingBot:
             "`/alerts` — список активных алертов\n"
             "`/rmalert ID` — удалить алерт\n"
             "`/clearalerts [SYMBOL]` — удалить все алерты\n\n"
+            "*Аналитика:*\n"
+            "`/atr SYMBOL` — ATR(21) в абсолютных значениях\n"
+            "  Пример: `/atr XMR` или `/atr SOL`\n\n"
             "*Экстренное:*\n"
             "`/kill` — 🛑 форсированная остановка бота",
             parse_mode=ParseMode.MARKDOWN
@@ -679,6 +682,80 @@ class TradingBot:
             "\n".join(lines), parse_mode=ParseMode.MARKDOWN
         )
 
+    # ── ATR (Average True Range) ─────────────────────────────────────────────
+    @restricted
+    async def cmd_atr(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        """
+        /atr SYMBOL — рассчитать ATR(21) в абсолютных значениях
+        """
+        self._register_chat(update)
+        if not ctx.args:
+            await update.message.reply_text(
+                "❌ Использование: `/atr SYMBOL`\n"
+                "Пример: `/atr XMR` или `/atr SOLUSDTM`",
+                parse_mode=ParseMode.MARKDOWN
+            )
+            return
+
+        symbol = ctx.args[0].upper()
+        if symbol.endswith("USDTM"):
+            pass
+        elif symbol.endswith("USDT"):
+            symbol += "M"
+        else:
+            symbol += "USDTM"
+
+        try:
+            # Получаем 22 дневных свечи (нужно 21 TR + 1 предыдущая)
+            klines = await self.client.get_klines(symbol, granularity=1440, count=25)
+
+            if not klines or len(klines) < 2:
+                await update.message.reply_text(
+                    f"❌ Недостаточно данных для `{symbol}`",
+                    parse_mode=ParseMode.MARKDOWN
+                )
+                return
+
+            # Сортируем по времени (старые → новые)
+            klines.sort(key=lambda x: x[0])
+
+            # Рассчитываем True Range для каждой свечи
+            # TR = max(high - low, |high - prev_close|, |low - prev_close|)
+            tr_values = []
+            for i in range(1, len(klines)):
+                high       = float(klines[i][2])
+                low        = float(klines[i][3])
+                prev_close = float(klines[i - 1][4])
+
+                tr = max(
+                    high - low,
+                    abs(high - prev_close),
+                    abs(low - prev_close)
+                )
+                tr_values.append(tr)
+
+            # ATR(21) — среднее последних 21 TR
+            period = 21
+            if len(tr_values) < period:
+                period = len(tr_values)
+
+            atr = sum(tr_values[-period:]) / period
+
+            # Текущая цена для процента
+            current_price = float(klines[-1][4])  # последний close
+            atr_pct = (atr / current_price * 100) if current_price > 0 else 0
+
+            await update.message.reply_text(
+                f"📊 *ATR({period}) для `{symbol}`*\n\n"
+                f"ATR: `{atr:.6f}`\n"
+                f"ATR %: `{atr_pct:.2f}%` от цены\n"
+                f"Цена: `{current_price}`\n\n"
+                f"_Дневные свечи, {len(tr_values)} значений TR_",
+                parse_mode=ParseMode.MARKDOWN
+            )
+        except Exception as e:
+            await update.message.reply_text(f"❌ Ошибка: {e}")
+
     # ── Kill (emergency stop) ────────────────────────────────────────────────
     @restricted
     async def cmd_kill(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -727,6 +804,7 @@ class TradingBot:
         app.add_handler(CommandHandler("rmalert",   self.cmd_rmalert))
         app.add_handler(CommandHandler("clearalerts", self.cmd_clearalerts))
         app.add_handler(CommandHandler("kill",       self.cmd_kill))
+        app.add_handler(CommandHandler("atr",        self.cmd_atr))
         app.add_handler(MessageHandler(filters.COMMAND, self.cmd_unknown))
 
         return app

@@ -330,6 +330,31 @@ class KuCoinFuturesClient:
         )
         return contracts_int, price, multiplier
 
+
+    async def get_klines(self, symbol: str, granularity: int = 1440,
+                         count: int = 30) -> list:
+        """
+        Получить свечи (klines) для символа.
+        granularity: минуты (1, 5, 15, 30, 60, 120, 240, 480, 720, 1440, 10080)
+                     1440 = 1 день
+        count: количество свечей
+        Returns: list of [time, open, high, low, close, volume]
+        """
+        import time as _time
+        now = int(_time.time())
+        start = now - count * granularity * 60
+
+        data = await self._request("GET", "/api/v1/kline/query", params={
+            "symbol":      symbol,
+            "granularity":  str(granularity),
+            "from":         str(start * 1000),
+            "to":           str(now * 1000),
+        })
+        # data — список списков: [[time, open, high, low, close, volume], ...]
+        if isinstance(data, list):
+            return data
+        return []
+
     # ── WebSocket token ───────────────────────────────────────────────────────
     async def get_private_ws_token(self) -> dict:
         return await self._request("POST", "/api/v1/bullet-private")
