@@ -686,7 +686,7 @@ class TradingBot:
     @restricted
     async def cmd_atr(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         """
-        /atr SYMBOL — рассчитать ATR(21) в абсолютных значениях
+        /atr SYMBOL — ATR(21) + дистанция пройденная за сегодня
         """
         self._register_chat(update)
         if not ctx.args:
@@ -706,7 +706,7 @@ class TradingBot:
             symbol += "USDTM"
 
         try:
-            # Получаем 22 дневных свечи (нужно 21 TR + 1 предыдущая)
+            # Получаем 25 дневных свечей (22 нужно для ATR21 + запас)
             klines = await self.client.get_klines(symbol, granularity=1440, count=25)
 
             if not klines or len(klines) < 2:
@@ -716,10 +716,10 @@ class TradingBot:
                 )
                 return
 
-            # Сортируем по времени (старые → новые)
+            # Сортируем по времени (старые -> новые)
             klines.sort(key=lambda x: x[0])
 
-            # Рассчитываем True Range для каждой свечи
+            # True Range для каждой свечи
             # TR = max(high - low, |high - prev_close|, |low - prev_close|)
             tr_values = []
             for i in range(1, len(klines)):
@@ -734,23 +734,45 @@ class TradingBot:
                 )
                 tr_values.append(tr)
 
-            # ATR(21) — среднее последних 21 TR
-            period = 21
-            if len(tr_values) < period:
-                period = len(tr_values)
-
+            # ATR(21)
+            period = min(21, len(tr_values))
             atr = sum(tr_values[-period:]) / period
 
-            # Текущая цена для процента
-            current_price = float(klines[-1][4])  # последний close
+            # Сегодняшняя свеча (последняя)
+            today = klines[-1]
+            today_high  = float(today[2])
+            today_low   = float(today[3])
+            today_open  = float(today[1])
+            today_close = float(today[4])
+            today_range = today_high - today_low
+
+            # Текущая цена
+            current_price = today_close
             atr_pct = (atr / current_price * 100) if current_price > 0 else 0
 
+            # Сколько от ATR пройдено сегодня
+            if atr > 0:
+                atr_used = today_range / atr * 100
+            else:
+                atr_used = 0
+
+            # Направление дня
+            if today_close >= today_open:
+                day_dir = "📈"
+                day_move = today_close - today_open
+            else:
+                day_dir = "📉"
+                day_move = today_open - today_close
+            day_move_pct = (day_move / today_open * 100) if today_open > 0 else 0
+
             await update.message.reply_text(
-                f"📊 *ATR({period}) для `{symbol}`*\n\n"
-                f"ATR: `{atr:.6f}`\n"
-                f"ATR %: `{atr_pct:.2f}%` от цены\n"
-                f"Цена: `{current_price}`\n\n"
-                f"_Дневные свечи, {len(tr_values)} значений TR_",
+                f"📊 *ATR({period}) — `{symbol}`*\n\n"
+                f"ATR: `{atr:.6f}` (`{atr_pct:.2f}%` от цены)\n\n"
+                f"*Сегодня:*\n"
+                f"  Диапазон: `{today_range:.6f}` (H `{today_high}` / L `{today_low}`)\n"
+                f"  Пройдено ATR: `{atr_used:.1f}%`\n"
+                f"  Движение: {day_dir} `{day_move:.6f}` (`{day_move_pct:.2f}%`)\n"
+                f"  Цена: `{current_price}`",
                 parse_mode=ParseMode.MARKDOWN
             )
         except Exception as e:
