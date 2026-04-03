@@ -142,54 +142,55 @@ class TradingBot:
     @restricted
     async def cmd_help(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
-            "*📖 Команды бота:*\n\n"
+            "*📖 Команды бота — Парадигма Фен-Шуй*\n\n"
             "*Информация:*\n"
             "`/status` — баланс аккаунта\n"
             "`/positions` — открытые позиции\n"
             "`/orders [SYMBOL]` — активные ордера\n"
             "`/price SYMBOL` — текущая цена\n"
+            "`/atr SYMBOL` — ATR(21) + дистанция за день\n"
             "`/alerts` — активные ценовые алерты\n\n"
+
             "*Вход в позицию:*\n"
-            "`/open SYMBOL SIDE USDT PRICE SL TRIG% LEV`\n"
-            "  → лимитный ордер по цене PRICE\n"
-            "  Пример: `/open TRUMPUSDTM buy 9 4.02 3.65 1 3`\n"
-            "  Long 9 USDT @ 4.02 | SL=3.65 | тейки каждые +1% | плечо 3x\n\n"
-            "`/stop SYMBOL SIDE USDT PRICE SL TRIG% LEV`\n"
-            "  → стоп-маркет ордер (вход на пробое цены)\n"
-            "  buy: вход когда цена *вырастет* до PRICE\n"
-            "  sell: вход когда цена *упадёт* до PRICE\n"
-            "  Пример: `/stop TRUMPUSDTM sell 9 3.80 4.10 1 3`\n\n"
-            "*Автологика после исполнения:*\n"
-            "  🛑 Стоп-лосс на SL\n"
-            "  ✂️ Тейк 1: 50% позиции при +TRIG% от входа\n"
-            "     → стоп в безубыток (цена входа)\n"
-            "  ✂️ Тейк 2: 50% остатка при +TRIG% от тейка 1\n"
-            "     → стоп на цену тейка 1\n"
-            "  ✂️ Тейк 3: весь остаток при +TRIG% от тейка 2\n"
-            "     → позиция закрыта полностью 🏁\n\n"
+            "`/open SYMBOL SIDE USDT PRICE SL LEV`\n"
+            "  Лимитный ордер. TP рассчитывается автоматически.\n"
+            "  Пример: `/open XMRUSDTM buy 20 330 325 5`\n"
+            "  → Long 20 USDT @ 330 | SL=325 | Плечо 5x\n"
+            "  → Stop size=5 | TP=330+15=345\n\n"
+
+            "`/stop SYMBOL SIDE USDT PRICE SL LEV`\n"
+            "  Стоп-маркет на вход (пробой уровня).\n"
+            "  Пример: `/stop XMRUSDTM sell 20 325 330 5`\n"
+            "  → Short при падении до 325 | SL=330 | TP=310\n\n"
+
+            "`/alert SYMBOL PRICE SIDE USDT SL LEV`\n"
+            "  Ценовой алерт + автооткрытие по рынку.\n"
+            "  Пример: `/alert XMR 330 buy 20 325 5`\n\n"
+
+            "`/market SYMBOL SIDE USDT [LEV]`\n"
+            "  Рыночный ордер (без автологики).\n\n"
+
+            "*Парадигма Фен-Шуй (автоматически):*\n"
+            "  Всё считается от `stop size` = |вход - SL|\n"
+            "  TP = вход ± 3 × stop size\n\n"
+            "  `1 stop` → SL на вход (безубыток)\n"
+            "  `2 стопа` → порез 50%, SL +1 stop, TP +1 stop\n"
+            "  `3 стопа` → порез 50% остатка, SL +1 stop, TP +1 stop\n"
+            "  `4+ стопов` → только углубление SL и TP\n\n"
+
             "*Управление:*\n"
-            "`/close SYMBOL [PCT%]` — ручной порез позиции\n"
-            "  Пример: `/close TRUMPUSDTM 50`\n"
-            "`/market SYMBOL SIDE USDT [LEV]` — рыночный ордер\n"
+            "`/close SYMBOL [PCT]` — ручной порез\n"
             "`/cancel ORDER_ID` — отмена ордера\n"
             "`/cancelall SYMBOL` — отмена всех ордеров\n"
-            "`/leverage SYMBOL VALUE` — установить плечо\n\n"
-            "*Ценовые алерты:*\n"
-            "`/alert SYMBOL PRICE SIDE USDT [SL] [TRIG%] [LEV]`\n"
-            "  → мониторинг цены, автооткрытие при достижении\n"
-            "  buy: вход когда цена *опустится* до PRICE\n"
-            "  sell: вход когда цена *вырастет* до PRICE\n"
-            "  Пример: `/alert WIFUSDTM 0.17 sell 9 0.175 2 5`\n"
-            "  Пример: `/alert XBTUSDTM 70000 buy 100 68000 2 10`\n\n"
-            "  После срабатывания — полная автологика тейков\n\n"
-            "`/alerts` — список активных алертов\n"
-            "`/rmalert ID` — удалить алерт\n"
-            "`/clearalerts [SYMBOL]` — удалить все алерты\n\n"
-            "*Аналитика:*\n"
-            "`/atr SYMBOL` — ATR(21) в абсолютных значениях\n"
-            "  Пример: `/atr XMR` или `/atr SOL`\n\n"
+            "`/leverage SYMBOL VALUE` — плечо\n\n"
+
+            "*Алерты:*\n"
+            "`/alerts` — список\n"
+            "`/rmalert ID` — удалить\n"
+            "`/clearalerts` — удалить все\n\n"
+
             "*Экстренное:*\n"
-            "`/kill` — 🛑 форсированная остановка бота",
+            "`/kill` — остановка бота",
             parse_mode=ParseMode.MARKDOWN
         )
 
@@ -280,19 +281,21 @@ class TradingBot:
     @restricted
     async def cmd_open(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         """
-        /open SYMBOL SIDE USDT PRICE SL TRIM% LEV
+        /open SYMBOL SIDE USDT PRICE SL [LEV]
+        Лимитный ордер + автологика Фен-Шуй.
         """
         self._register_chat(update)
         args = ctx.args
-        if len(args) < 6:
+        if len(args) < 5:
             await update.message.reply_text(
                 "❌ Использование:\n"
-                "`/open SYMBOL SIDE USDT PRICE SL TRIM% LEV`\n\n"
+                "`/open SYMBOL SIDE USDT PRICE SL [LEV]`\n\n"
                 "Пример:\n"
-                "`/open TRUMPUSDTM buy 9 4.020 3.653 10 3`\n"
-                "  USDT=9 | Цена=4.020 | SL=3.653 | Порез при +10% | Плечо 3x\n\n"
-                "`/open SKYUSDTM sell 9 0.085 0.092 10 5`\n"
-                "  Шорт | Цена=0.085 | SL=0.092 | Порез при +10% | Плечо 5x",
+                "`/open XMRUSDTM buy 20 330 325 5`\n"
+                "  → Long 20 USDT @ 330 | SL=325 | TP=345\n"
+                "  → Stop size=5, плечо 5x\n\n"
+                "`/open ETHUSDTM sell 50 3800 3850 3`\n"
+                "  → Short @ 3800 | SL=3850 | TP=3650",
                 parse_mode=ParseMode.MARKDOWN
             )
             return
@@ -305,16 +308,15 @@ class TradingBot:
         try:
             usdt_amount = _float(args[2])
             price       = _float(args[3])
-            sl_price    = _parse(args, 4, float, 0.0)   # 0 = без стопа
-            trim_pct    = _parse(args, 5, float, config.DEFAULT_PROFIT_TRIGGER_PCT)
-            lev         = _parse(args, 6, int,   config.DEFAULT_LEVERAGE)
+            sl_price    = _float(args[4])
+            lev         = _parse(args, 5, int, config.DEFAULT_LEVERAGE)
 
             self.monitor.subscribe_ticker(symbol)
             self.manager.set_leverage(symbol, lev)
 
             await self.manager.place_limit_order(
                 symbol, side, usdt_amount, price,
-                sl_price=sl_price, trim_pct=trim_pct, leverage=lev,
+                sl_price=sl_price, trim_pct=0, leverage=lev,
             )
         except Exception as e:
             logger.error(f"cmd_open error: {e}", exc_info=True)
@@ -323,24 +325,20 @@ class TradingBot:
     @restricted
     async def cmd_stop_entry(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         """
-        /stop SYMBOL SIDE USDT PRICE SL TRIG% LEV
-        Стоп-маркет на вход — та же логика что и /open.
-        buy:  вход когда цена вырастет до PRICE
-        sell: вход когда цена упадёт до PRICE
+        /stop SYMBOL SIDE USDT PRICE SL [LEV]
+        Стоп-маркет на вход + автологика Фен-Шуй.
         """
         self._register_chat(update)
         args = ctx.args
         if len(args) < 5:
             await update.message.reply_text(
                 "❌ Использование:\n"
-                "`/stop SYMBOL SIDE USDT PRICE SL TRIG% LEV`\n\n"
+                "`/stop SYMBOL SIDE USDT PRICE SL [LEV]`\n\n"
                 "Пример:\n"
-                "`/stop TRUMPUSDTM buy 9 4.10 3.65 1 3`\n"
-                "  → Вход LONG когда цена вырастет до `4.10`\n"
-                "  → Стоп-лосс: `3.65`\n"
-                "  → Тейк 1: 50% при `+1%`, тейк 2: 50% от остатка при ещё `+1%`\n\n"
-                "`/stop TRUMPUSDTM sell 9 3.80 4.10 1 3`\n"
-                "  → Вход SHORT когда цена упадёт до `3.80`",
+                "`/stop XMRUSDTM buy 20 340 335 5`\n"
+                "  → Вход LONG при росте до 340 | SL=335 | TP=355\n\n"
+                "`/stop XMRUSDTM sell 20 325 330 5`\n"
+                "  → Вход SHORT при падении до 325 | SL=330 | TP=310",
                 parse_mode=ParseMode.MARKDOWN
             )
             return
@@ -353,16 +351,15 @@ class TradingBot:
         try:
             usdt_amount = _float(args[2])
             price       = _float(args[3])
-            sl_price    = _parse(args, 4, float, 0.0)
-            trim_pct    = _parse(args, 5, float, config.DEFAULT_PROFIT_TRIGGER_PCT)
-            lev         = _parse(args, 6, int,   config.DEFAULT_LEVERAGE)
+            sl_price    = _float(args[4])
+            lev         = _parse(args, 5, int, config.DEFAULT_LEVERAGE)
 
             self.manager.set_leverage(symbol, lev)
             self.monitor.subscribe_ticker(symbol)
 
             await self.manager.place_stop_entry(
                 symbol, side, usdt_amount, price,
-                sl_price=sl_price, trim_pct=trim_pct, leverage=lev,
+                sl_price=sl_price, trim_pct=0, leverage=lev,
             )
         except Exception as e:
             await update.message.reply_text(f"❌ Ошибка: {e}")
@@ -546,35 +543,33 @@ class TradingBot:
     @restricted
     async def cmd_alert(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         """
-        /alert SYMBOL PRICE SIDE USDT [SL] [TRIG%] [LEV]
-        Добавить ценовой алерт с автооткрытием позиции.
+        /alert SYMBOL PRICE SIDE USDT SL [LEV]
+        Ценовой алерт + автооткрытие + Фен-Шуй.
         """
         self._register_chat(update)
         args = ctx.args
-        if len(args) < 4:
+        if len(args) < 5:
             await update.message.reply_text(
                 "❌ Использование:\n"
-                "`/alert SYMBOL PRICE SIDE USDT [SL] [TRIG%] [LEV]`\n\n"
+                "`/alert SYMBOL PRICE SIDE USDT SL [LEV]`\n\n"
                 "Параметры:\n"
                 "  `SYMBOL` — торговая пара\n"
                 "  `PRICE` — цена срабатывания\n"
                 "  `SIDE` — `buy` (long) или `sell` (short)\n"
                 "  `USDT` — размер позиции\n"
-                "  `SL` — стоп-лосс (0 = без)\n"
-                "  `TRIG%` — шаг тейков в %\n"
+                "  `SL` — стоп-лосс\n"
                 "  `LEV` — плечо\n\n"
                 "Примеры:\n"
-                "`/alert WIFUSDTM 0.17 sell 9 0.175 2 5`\n"
-                "`/alert XBTUSDTM 70000 buy 100 68000 2 10`\n\n"
-                "buy: вход когда цена *опустится* до PRICE\n"
-                "sell: вход когда цена *вырастет* до PRICE",
+                "`/alert XMR 330 buy 20 325 5`\n"
+                "  → Лонг при 330 | SL=325 | TP=345\n\n"
+                "`/alert XMR 340 sell 20 345 5`\n"
+                "  → Шорт при 340 | SL=345 | TP=325",
                 parse_mode=ParseMode.MARKDOWN
             )
             return
 
         try:
             symbol      = args[0].upper()
-            # Нормализация символа
             if symbol.endswith("USDTM"):
                 pass
             elif symbol.endswith("USDT"):
@@ -591,9 +586,8 @@ class TradingBot:
                                                  parse_mode=ParseMode.MARKDOWN)
                 return
 
-            sl_price = _parse(args, 4, float, 0.0)
-            trim_pct = _parse(args, 5, float, None)
-            leverage = _parse(args, 6, int, None)
+            sl_price = _float(args[4]) if len(args) > 4 else 0.0
+            leverage = _parse(args, 5, int, None)
 
             alert = await self.alert_manager.add_alert(
                 symbol=symbol,
@@ -601,20 +595,29 @@ class TradingBot:
                 side=side,
                 usdt_amount=usdt_amount,
                 sl_price=sl_price,
-                trim_pct=trim_pct,
+                trim_pct=0,
                 leverage=leverage,
             )
 
             direction = "📉 ждём падения до" if alert.direction == "down" else "📈 ждём роста до"
-            sl_str = f"\n🛑 Стоп-лосс: `{sl_price}`" if sl_price > 0 else ""
+            stop_size = abs(price - sl_price) if sl_price > 0 else 0
+            if stop_size > 0:
+                if side == "buy":
+                    tp_est = round(price + 3 * stop_size, 8)
+                else:
+                    tp_est = round(price - 3 * stop_size, 8)
+                tp_str = f"\nTP (расчётный): `{tp_est}` (3x stop)"
+            else:
+                tp_str = ""
+
             await update.message.reply_text(
-                f"✅ *Алерт #{alert.id} добавлен*\n"
+                f"✅ *Алерт #{alert.id} — Фен-Шуй*\n"
                 f"Символ: `{alert.symbol}`\n"
                 f"Направление: `{'LONG 📈' if side=='buy' else 'SHORT 📉'}`\n"
                 f"Триггер: {direction} `{price}`\n"
-                f"Объём: `{usdt_amount} USDT` | Плечо: `{alert.leverage}x`{sl_str}\n"
-                f"Тейки каждые `+{alert.trim_pct}%`\n\n"
-                f"_Мониторинг запущен. При достижении цены — автооткрытие._",
+                f"Объём: `{usdt_amount} USDT` | Плечо: `{alert.leverage}x`\n"
+                f"SL: `{sl_price}` | Stop size: `{stop_size}`{tp_str}\n\n"
+                f"_Мониторинг запущен. При достижении — автовход + сопровождение._",
                 parse_mode=ParseMode.MARKDOWN
             )
         except Exception as e:
@@ -664,19 +667,20 @@ class TradingBot:
         alerts = self.alert_manager.list_alerts()
         if not alerts:
             await update.message.reply_text("📭 Нет активных алертов\n"
-                                             "Добавьте: `/alert SYMBOL PRICE SIDE USDT [SL] [TRIG%] [LEV]`",
+                                             "Добавьте: `/alert SYMBOL PRICE SIDE USDT SL LEV`",
                                              parse_mode=ParseMode.MARKDOWN)
             return
 
         lines = [f"*🔔 Активные алерты ({len(alerts)}):*\n"]
         for a in alerts:
             direction = "📉 падение до" if a.direction == "down" else "📈 рост до"
-            sl_str   = f" | SL: `{a.sl_price}`" if a.sl_price > 0 else ""
+            stop_size = abs(a.trigger_price - a.sl_price) if a.sl_price > 0 else 0
+            sl_str = f" | SL: `{a.sl_price}`" if a.sl_price > 0 else ""
+            stop_str = f" | Stop: `{stop_size}`" if stop_size > 0 else ""
             lines.append(
                 f"*#{a.id}* `{a.symbol}` {a.side.upper()}\n"
-                f"  Триггер: {direction} `{a.trigger_price}`\n"
-                f"  Объём: `{a.usdt_amount} USDT` | Плечо: `{a.leverage}x`{sl_str}\n"
-                f"  Тейки каждые `+{a.trim_pct}%`\n"
+                f"  {direction} `{a.trigger_price}`{sl_str}{stop_str}\n"
+                f"  Объём: `{a.usdt_amount} USDT` | Плечо: `{a.leverage}x`\n"
             )
         await update.message.reply_text(
             "\n".join(lines), parse_mode=ParseMode.MARKDOWN

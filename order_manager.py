@@ -1,19 +1,19 @@
 """
-order_manager.py
+order_manager.py — Парадигма Фен-Шуй
 
-/open SYMBOL SIDE USDT PRICE SL TRIG% LEV
+Логика сопровождения привязана к размеру стопа (stop_size = |entry - SL|):
 
-Флоу:
-  1. Лимитный ордер на вход (REST)
-  2. После исполнения (WebSocket on_order_filled):
-     - Стоп-маркет тейк 50% на цене входа +/- TRIG% (reduceOnly)
-     - Стоп-маркет стоп-лосс на SL (reduceOnly)
-  3. При исполнении тейка (WebSocket on_order_filled):
-     - Отмена старого стоп-лосса (REST)
-     - Новый стоп-маркет в безубыток для оставшихся 50% (REST, reduceOnly)
+  1 stop пройден → безубыток (SL на entry)
+  2 стопа       → порез 50% от начального, SL на entry+1×stop, TP +1×stop
+  3 стопа       → порез 50% от остатка, SL на entry+2×stop, TP +1×stop
+  4+ стопов     → только углубление SL и TP на 1×stop каждый уровень
+
+Мониторинг через WebSocket price_update.
+SL и TP — реальные стоп-маркет ордера на бирже (reduceOnly).
 """
 
 import asyncio
+import math
 from dataclasses import dataclass
 from typing import Optional, Callable
 from loguru import logger
@@ -25,23 +25,29 @@ import config
 @dataclass
 class Plan:
     symbol:         str
-    side:           str
-    entry_price:    float
-    contracts:      int
-    sl_price:       float
-    trim_pct:       float
+    side:           str        # buy / sell
+    entry_price:    float      # цена входа (уточняется из позиции)
+    contracts:      int        # начальный объём
+    initial_sl:     float      # начальный SL (не меняется, для расчёта stop_size)
+    stop_size:      float      # abs(entry - initial_sl) — НЕ МЕНЯЕТСЯ
     leverage:       int
+
+    # Текущее состояние
+    remaining:      int = 0    # контрактов в рынке
+    stops_passed:   int = 0    # сколько stop_size пройдено
+    current_sl:     float = 0  # текущий SL (обновляется)
+    current_tp:     float = 0  # текущий TP (обновляется)
+
+    # ID ордеров на бирже
     entry_order_id: Optional[str] = None
     sl_order_id:    Optional[str] = None
-    take_order_id:  Optional[str] = None   # тейк 1 — 50%
-    take2_order_id: Optional[str] = None   # тейк 2 — 50% от остатка
-    take3_order_id: Optional[str] = None   # тейк 3 — весь остаток
-    take1_price:    float = 0.0            # цена тейка 1
-    take2_price:    float = 0.0            # цена тейка 2
-    filled:  bool = False
-    taken:   bool = False
-    taken2:  bool = False
-    taken3:  bool = False
+    tp_order_id:    Optional[str] = None
+
+    filled: bool = False       # вход исполнен
+
+    # Для обратной совместимости с /trailing
+    sl_price:    float = 0     # alias для initial_sl
+    trim_pct:    float = 0     # не используется в Фен-Шуй
 
 
 class OrderManager:
@@ -66,11 +72,110 @@ class OrderManager:
         except Exception as e:
             logger.error(f"Notify error: {e}")
 
-    # ─────────────────────────────────────────────────────────────────────────
-    # ШАГ 1а: /stop — стоп-маркет на вход (заблаговременно)
-    # buy:  активируется когда цена вырастет до PRICE
-    # sell: активируется когда цена упадёт до PRICE
-    # ─────────────────────────────────────────────────────────────────────────
+    # ─── Helpers ──────────────────────────────────────────────────────────────
+
+    def _close_side(self, plan: Plan) -> str:
+        return "sell" if plan.side == "buy" else "buy"
+
+    def _sl_direction(self, plan: Plan) -> str:
+        """Направление стопа: down для buy (цена падает → стоп), up для sell."""
+        return "down" if plan.side == "buy" else "up"
+
+    def _tp_direction(self, plan: Plan) -> str:
+        """Направление тейка: up для buy (цена растёт → тейк), down для sell."""
+        return "up" if plan.side == "buy" else "down"
+
+    def _price_at_stops(self, plan: Plan, n_stops: int) -> float:
+        """Цена на расстоянии n стопов от входа в сторону TP."""
+        if plan.side == "buy":
+            return round(plan.entry_price + n_stops * plan.stop_size, 8)
+        else:
+            return round(plan.entry_price - n_stops * plan.stop_size, 8)
+
+    async def _cancel_safe(self, order_id: str):
+        """Отменить ордер, игнорируя ошибки (уже исполнен/не существует)."""
+        if not order_id:
+            return
+        try:
+            await self.client.cancel_order(order_id)
+        except Exception:
+            pass
+
+    async def _place_sl(self, plan: Plan) -> str:
+        """Выставить стоп-лосс на бирже. Возвращает orderId."""
+        data = await self.client.place_stop_market_close(
+            plan.symbol, self._close_side(plan), plan.remaining,
+            plan.current_sl, self._sl_direction(plan), plan.leverage
+        )
+        return data.get("orderId", "")
+
+    async def _place_tp(self, plan: Plan) -> str:
+        """Выставить тейк-профит на бирже. Возвращает orderId."""
+        data = await self.client.place_stop_market_close(
+            plan.symbol, self._close_side(plan), plan.remaining,
+            plan.current_tp, self._tp_direction(plan), plan.leverage
+        )
+        return data.get("orderId", "")
+
+    async def _update_orders(self, plan: Plan, reason: str):
+        """Отменить старые SL/TP и выставить новые."""
+        # Отменяем старые
+        await self._cancel_safe(plan.sl_order_id)
+        await self._cancel_safe(plan.tp_order_id)
+        plan.sl_order_id = None
+        plan.tp_order_id = None
+
+        if plan.remaining <= 0:
+            return
+
+        # Новый SL
+        try:
+            plan.sl_order_id = await self._place_sl(plan)
+            logger.info(f"SL updated: {plan.symbol} @ {plan.current_sl} "
+                        f"({plan.remaining}c) -> {plan.sl_order_id}")
+        except Exception as e:
+            logger.error(f"SL placement failed: {e}")
+            await self._send(f"⚠️ SL не выставлен для `{plan.symbol}`: `{e}`")
+
+        # Новый TP
+        try:
+            plan.tp_order_id = await self._place_tp(plan)
+            logger.info(f"TP updated: {plan.symbol} @ {plan.current_tp} "
+                        f"({plan.remaining}c) -> {plan.tp_order_id}")
+        except Exception as e:
+            logger.error(f"TP placement failed: {e}")
+            await self._send(f"⚠️ TP не выставлен для `{plan.symbol}`: `{e}`")
+
+    # ═════════════════════════════════════════════════════════════════════════
+    #  ВХОД В ПОЗИЦИЮ
+    # ═════════════════════════════════════════════════════════════════════════
+
+    def _create_plan(self, symbol: str, side: str, contracts: int,
+                     entry_price: float, sl_price: float,
+                     leverage: int, entry_order_id: str) -> Plan:
+        """Создать план сопровождения."""
+        stop_size = abs(entry_price - sl_price)
+
+        # TP = entry + 3 * stop_size (для buy) / entry - 3 * stop_size (для sell)
+        if side == "buy":
+            tp_price = round(entry_price + 3 * stop_size, 8)
+        else:
+            tp_price = round(entry_price - 3 * stop_size, 8)
+
+        plan = Plan(
+            symbol=symbol, side=side,
+            entry_price=entry_price, contracts=contracts,
+            initial_sl=sl_price, stop_size=stop_size,
+            leverage=leverage,
+            remaining=contracts, stops_passed=0,
+            current_sl=sl_price, current_tp=tp_price,
+            entry_order_id=entry_order_id,
+            sl_price=sl_price,
+        )
+        self._plans[symbol] = plan
+        return plan
+
+    # ── /stop — стоп-маркет на вход ──────────────────────────────────────────
     async def place_stop_entry(self, symbol: str, side: str,
                                usdt_amount: float, price: float,
                                sl_price: float, trim_pct: float,
@@ -78,395 +183,315 @@ class OrderManager:
 
         old = self._plans.get(symbol)
         if old:
-            for oid in [old.sl_order_id, old.take_order_id, old.take2_order_id]:
-                if oid:
-                    try:
-                        await self.client.cancel_order(oid)
-                    except Exception as e:
-                        logger.warning(f"Could not cancel old order {oid}: {e}")
+            await self._cancel_safe(old.sl_order_id)
+            await self._cancel_safe(old.tp_order_id)
 
         contracts, _, multiplier = await self.client.usdt_to_contracts(symbol, usdt_amount, price)
         actual_usdt = contracts * price * multiplier
         stop_direction = "up" if side == "buy" else "down"
 
-        data     = await self.client.place_stop_market_entry(
+        data = await self.client.place_stop_market_entry(
             symbol, side, contracts, price, stop_direction, leverage
         )
         order_id = data.get("orderId", "")
 
-        self._plans[symbol] = Plan(
-            symbol=symbol, side=side,
-            entry_price=price, contracts=contracts,
-            sl_price=sl_price, trim_pct=trim_pct,
-            leverage=leverage, entry_order_id=order_id,
-        )
+        plan = self._create_plan(symbol, side, contracts, price, sl_price, leverage, order_id)
 
-        sl_line = f"\n  🛑 Стоп-лосс: `{sl_price}`" if sl_price > 0 else ""
-        logger.info(f"Stop entry: {symbol} {side} {contracts}c @{price} SL={sl_price} → {order_id}")
+        logger.info(f"Stop entry: {symbol} {side} {contracts}c @{price} "
+                    f"SL={sl_price} stop_size={plan.stop_size} -> {order_id}")
         await self._send(
-            f"🎯 *Стоп-маркет на вход выставлен*\n"
-            f"Символ: `{symbol}`\n"
-            f"Направление: `{'LONG 📈' if side=='buy' else 'SHORT 📉'}`\n"
-            f"Размер: `{actual_usdt:.2f} USDT` → `{contracts}` контрактов\n"
-            f"{'📈 Вход при росте до' if side=='buy' else '📉 Вход при падении до'} `{price}`\n"
-            f"Плечо: `{leverage}x`\n"
-            f"После исполнения:{sl_line}\n"
-            f"  ✂️ Тейк 1: 50% при `+{trim_pct}%`\n"
-            f"  ✂️ Тейк 2: 50% от остатка при ещё `+{trim_pct}%`\n"
-            f"  🎯 Безубыток и перенос стопа автоматически\n"
+            f"🎯 *Стоп-маркет на вход*\n"
+            f"Символ: `{symbol}` | `{'LONG 📈' if side=='buy' else 'SHORT 📉'}`\n"
+            f"Размер: `{actual_usdt:.2f} USDT` -> `{contracts}` контрактов\n"
+            f"Вход: `{price}` | Плечо: `{leverage}x`\n"
+            f"SL: `{sl_price}` | Stop size: `{plan.stop_size}`\n"
+            f"TP: `{plan.current_tp}` (3x stop)\n"
             f"ID: `{order_id}`"
         )
         return order_id
 
-    # ─────────────────────────────────────────────────────────────────────────
-    # ШАГ 1б: /open — лимитный ордер на вход
-    # ─────────────────────────────────────────────────────────────────────────
+    # ── /open — лимитный ордер на вход ───────────────────────────────────────
     async def place_limit_order(self, symbol: str, side: str,
                                 usdt_amount: float, price: float,
                                 sl_price: float, trim_pct: float,
                                 leverage: int) -> str:
 
-        # Если есть старый план — отменяем его ордера
         old = self._plans.get(symbol)
         if old:
-            for oid in [old.sl_order_id, old.take_order_id]:
-                if oid:
-                    try:
-                        await self.client.cancel_order(oid)
-                        logger.info(f"Cancelled old order {oid} for {symbol}")
-                    except Exception as e:
-                        logger.warning(f"Could not cancel old order {oid}: {e}")
+            await self._cancel_safe(old.sl_order_id)
+            await self._cancel_safe(old.tp_order_id)
 
-        contracts, _, multiplier = await self.client.usdt_to_contracts(
-            symbol, usdt_amount, price
-        )
+        contracts, _, multiplier = await self.client.usdt_to_contracts(symbol, usdt_amount, price)
         actual_usdt = contracts * price * multiplier
 
-        data     = await self.client.place_limit_order(symbol, side, contracts, price, leverage)
+        data = await self.client.place_limit_order(symbol, side, contracts, price, leverage)
         order_id = data.get("orderId", "")
 
-        self._plans[symbol] = Plan(
-            symbol=symbol, side=side,
-            entry_price=price, contracts=contracts,
-            sl_price=sl_price, trim_pct=trim_pct,
-            leverage=leverage, entry_order_id=order_id,
-        )
+        plan = self._create_plan(symbol, side, contracts, price, sl_price, leverage, order_id)
 
-        sl_line = f"\n  🛑 Стоп-лосс: `{sl_price}`" if sl_price > 0 else ""
-        logger.info(f"Limit order: {symbol} {side} {contracts}c @{price} SL={sl_price} → {order_id}")
+        logger.info(f"Limit order: {symbol} {side} {contracts}c @{price} "
+                    f"SL={sl_price} stop_size={plan.stop_size} -> {order_id}")
         await self._send(
-            f"📋 *Лимитный ордер выставлен*\n"
-            f"Символ: `{symbol}`\n"
-            f"Направление: `{'LONG 📈' if side=='buy' else 'SHORT 📉'}`\n"
-            f"Размер: `{actual_usdt:.2f} USDT` → `{contracts}` контрактов\n"
-            f"Цена: `{price}`  |  Плечо: `{leverage}x`\n"
-            f"После исполнения:{sl_line}\n"
-            f"  ✂️ Тейк 50% при движении `+{trim_pct}%`\n"
-            f"  🎯 Безубыток после тейка\n"
+            f"📋 *Лимитный ордер*\n"
+            f"Символ: `{symbol}` | `{'LONG 📈' if side=='buy' else 'SHORT 📉'}`\n"
+            f"Размер: `{actual_usdt:.2f} USDT` -> `{contracts}` контрактов\n"
+            f"Цена: `{price}` | Плечо: `{leverage}x`\n"
+            f"SL: `{sl_price}` | Stop size: `{plan.stop_size}`\n"
+            f"TP: `{plan.current_tp}` (3x stop)\n"
             f"ID: `{order_id}`"
         )
         return order_id
 
-    # ─────────────────────────────────────────────────────────────────────────
-    # ШАГ 1в: Маркет-ордер с планом (для алертов)
-    # Вход по рынку + полная автологика тейков/SL/безубытка
-    # ─────────────────────────────────────────────────────────────────────────
+    # ── Маркет с планом (для алертов) ────────────────────────────────────────
     async def place_market_with_plan(self, symbol: str, side: str,
                                      usdt_amount: float, sl_price: float,
                                      trim_pct: float, leverage: int) -> str:
-        """
-        Рыночный ордер + создание плана для автоматических тейков/SL.
-        Вызывается из AlertManager при срабатывании ценового алерта.
-        Та же логика что и place_limit_order / place_stop_entry,
-        но вход по рынку — on_order_filled подхватит и выставит тейки.
-        """
-        # Отменяем старый план если есть
+
         old = self._plans.get(symbol)
         if old:
-            for oid in [old.sl_order_id, old.take_order_id,
-                        old.take2_order_id, old.take3_order_id]:
-                if oid:
-                    try:
-                        await self.client.cancel_order(oid)
-                    except Exception as e:
-                        logger.warning(f"Could not cancel old order {oid}: {e}")
+            await self._cancel_safe(old.sl_order_id)
+            await self._cancel_safe(old.tp_order_id)
 
-        contracts, price, multiplier = await self.client.usdt_to_contracts(
-            symbol, usdt_amount
-        )
+        contracts, price, multiplier = await self.client.usdt_to_contracts(symbol, usdt_amount)
         actual_usdt = contracts * price * multiplier
 
-        data     = await self.client.place_market_order(
-            symbol, side, contracts, leverage
-        )
+        data = await self.client.place_market_order(symbol, side, contracts, leverage)
         order_id = data.get("orderId", "")
 
-        # Создаём план — on_order_filled подхватит по entry_order_id
-        self._plans[symbol] = Plan(
-            symbol=symbol, side=side,
-            entry_price=price,   # будет уточнена из позиции в on_order_filled
-            contracts=contracts,
-            sl_price=sl_price, trim_pct=trim_pct,
-            leverage=leverage, entry_order_id=order_id,
-        )
+        plan = self._create_plan(symbol, side, contracts, price, sl_price, leverage, order_id)
 
-        sl_line = f"\n  🛑 Стоп-лосс: `{sl_price}`" if sl_price > 0 else ""
         logger.info(f"Market with plan: {symbol} {side} {contracts}c "
-                    f"SL={sl_price} trim={trim_pct}% → {order_id}")
+                    f"SL={sl_price} stop_size={plan.stop_size} -> {order_id}")
         await self._send(
-            f"📋 *Маркет-ордер с планом (алерт)*\n"
-            f"Символ: `{symbol}`\n"
-            f"Направление: `{'LONG 📈' if side=='buy' else 'SHORT 📉'}`\n"
-            f"Размер: `{actual_usdt:.2f} USDT` → `{contracts}` контрактов\n"
+            f"📋 *Маркет-ордер (алерт)*\n"
+            f"Символ: `{symbol}` | `{'LONG 📈' if side=='buy' else 'SHORT 📉'}`\n"
+            f"Размер: `{actual_usdt:.2f} USDT` -> `{contracts}` контрактов\n"
             f"Плечо: `{leverage}x`\n"
-            f"После исполнения:{sl_line}\n"
-            f"  ✂️ Тейк 1: 50% при `+{trim_pct}%`\n"
-            f"  ✂️ Тейк 2: 50% от остатка при ещё `+{trim_pct}%`\n"
-            f"  🎯 Безубыток и перенос стопа автоматически\n"
+            f"SL: `{sl_price}` | Stop size: `{plan.stop_size}`\n"
+            f"TP: `{plan.current_tp}` (3x stop)\n"
             f"ID: `{order_id}`"
         )
         return order_id
 
-    # ─────────────────────────────────────────────────────────────────────────
-    # ШАГ 2: после исполнения лимитки — выставляем тейк и SL
-    # ─────────────────────────────────────────────────────────────────────────
+    # ═════════════════════════════════════════════════════════════════════════
+    #  ПОСЛЕ ИСПОЛНЕНИЯ ВХОДА — выставляем SL и TP
+    # ═════════════════════════════════════════════════════════════════════════
+
     async def _on_entry_filled(self, plan: Plan, fill_price: float):
+        """Вход исполнен — пересчитываем stop_size и выставляем ордера."""
         plan.entry_price = fill_price
-        close_side  = "sell" if plan.side == "buy" else "buy"
+        plan.stop_size = abs(fill_price - plan.initial_sl)
+        plan.remaining = plan.contracts
 
-        logger.info(f"_on_entry_filled: symbol={plan.symbol} side={plan.side} "
-                    f"fill={fill_price} sl={plan.sl_price} trim={plan.trim_pct}% "
-                    f"contracts={plan.contracts}")
-
-        # При 1 контракте порез невозможен — ставим только SL, тейк на весь объём
-        if plan.contracts <= 1:
-            half = 1
-            await self._send(
-                f"⚠️ *Позиция слишком мала для пореза*\n"
-                f"Символ: `{plan.symbol}` — всего `{plan.contracts}` контракт(ов)\n"
-                f"Тейк будет на весь объём (без пореза 50%)"
-            )
-        else:
-            half = plan.contracts // 2
-
-        # Цена тейка: лонг → выше на trim_pct%, шорт → ниже
+        # Пересчитываем TP по реальной цене входа
         if plan.side == "buy":
-            take_price     = round(fill_price * (1 + plan.trim_pct / 100), 8)
-            take_direction = "up"
-            sl_direction   = "down"
+            plan.current_tp = round(fill_price + 3 * plan.stop_size, 8)
         else:
-            take_price     = round(fill_price * (1 - plan.trim_pct / 100), 8)
-            take_direction = "down"
-            sl_direction   = "up"
+            plan.current_tp = round(fill_price - 3 * plan.stop_size, 8)
 
-        # Тейк-профит 50% — стоп-маркет reduceOnly
-        try:
-            data = await self.client.place_stop_market_close(
-                plan.symbol, close_side, half,
-                take_price, take_direction, plan.leverage
-            )
-            plan.take_order_id = data.get("orderId", "")
-            logger.info(f"Take order: {plan.symbol} {half}c @ {take_price} → {plan.take_order_id}")
-            await self._send(
-                f"✂️ *Тейк-профит 50% выставлен*\n"
-                f"Символ: `{plan.symbol}`\n"
-                f"Цена входа: `{fill_price}`\n"
-                f"Цена тейка: `{take_price}` (`+{plan.trim_pct}%`)\n"
-                f"Контрактов: `{half}` из `{plan.contracts}`\n"
-                f"ID: `{plan.take_order_id}`"
-            )
-        except Exception as e:
-            logger.error(f"Take order failed: {e}")
-            await self._send(f"⚠️ Тейк не выставлен по `{plan.symbol}`: `{e}`")
+        plan.current_sl = plan.initial_sl
 
-        # Стоп-лосс — стоп-маркет reduceOnly
-        if plan.sl_price > 0:
-            try:
-                data = await self.client.place_stop_market_close(
-                    plan.symbol, close_side, plan.contracts,
-                    plan.sl_price, sl_direction, plan.leverage
-                )
-                plan.sl_order_id = data.get("orderId", "")
-                logger.info(f"SL order: {plan.symbol} @ {plan.sl_price} → {plan.sl_order_id}")
-                await self._send(
-                    f"🛑 *Стоп-лосс выставлен*\n"
-                    f"Символ: `{plan.symbol}`\n"
-                    f"Цена стопа: `{plan.sl_price}`\n"
-                    f"ID: `{plan.sl_order_id}`"
-                )
-            except Exception as e:
-                logger.error(f"SL order failed: {e}")
-                await self._send(
-                    f"⚠️ Стоп-лосс не выставлен по `{plan.symbol}`: `{e}`\n"
-                    f"Выставьте вручную на: `{plan.sl_price}`"
-                )
-
-    # ─────────────────────────────────────────────────────────────────────────
-    # ШАГ 3: тейк 1 исполнился — безубыток + тейк 2
-    # ─────────────────────────────────────────────────────────────────────────
-    async def _on_take_filled(self, plan: Plan, fill_price: float):
-        plan.take1_price = fill_price   # запоминаем цену тейка 1
-        close_side      = "sell" if plan.side == "buy" else "buy"
-        half            = plan.contracts // 2
-        remaining       = max(1, plan.contracts - half)  # ~50% остаток
-        quarter         = max(1, remaining // 2)          # 50% от остатка
-
-        if plan.side == "buy":
-            be_direction   = "down"
-            take2_price    = round(fill_price * (1 + plan.trim_pct / 100), 8)
-            take2_direction = "up"
-        else:
-            be_direction   = "up"
-            take2_price    = round(fill_price * (1 - plan.trim_pct / 100), 8)
-            take2_direction = "down"
-
-        # Отменяем старый SL
-        if plan.sl_order_id:
-            try:
-                await self.client.cancel_order(plan.sl_order_id)
-                logger.info(f"Cancelled old SL {plan.sl_order_id}")
-            except Exception as e:
-                logger.warning(f"Cancel SL failed: {e}")
-            plan.sl_order_id = None
-
-        # Безубыток на цену входа для остатка
-        try:
-            data = await self.client.place_stop_market_close(
-                plan.symbol, close_side, remaining,
-                plan.entry_price, be_direction, plan.leverage
-            )
-            plan.sl_order_id = data.get("orderId", "")
-            logger.info(f"Breakeven: {plan.symbol} @ {plan.entry_price} → {plan.sl_order_id}")
-            await self._send(
-                f"🎯 *Стоп в безубыток*\n"
-                f"Символ: `{plan.symbol}`\n"
-                f"Тейк 1 исполнен по: `{fill_price}`\n"
-                f"Стоп на цене входа: `{plan.entry_price}`\n"
-                f"Остаток: `{remaining}` контрактов\n"
-                f"ID: `{plan.sl_order_id}`"
-            )
-        except Exception as e:
-            logger.error(f"Breakeven failed: {e}")
-            await self._send(f"⚠️ Безубыток не выставлен: `{e}`\nСтоп вручную на: `{plan.entry_price}`")
-
-        # Тейк 2 — 50% от остатка при движении ещё на trim_pct%
-        try:
-            data = await self.client.place_stop_market_close(
-                plan.symbol, close_side, quarter,
-                take2_price, take2_direction, plan.leverage
-            )
-            plan.take2_order_id = data.get("orderId", "")
-            logger.info(f"Take2: {plan.symbol} {quarter}c @ {take2_price} → {plan.take2_order_id}")
-            await self._send(
-                f"✂️ *Тейк 2 выставлен*\n"
-                f"Символ: `{plan.symbol}`\n"
-                f"Цена тейка 2: `{take2_price}` (`+{plan.trim_pct}%` от тейка 1)\n"
-                f"Контрактов: `{quarter}` из `{remaining}`\n"
-                f"ID: `{plan.take2_order_id}`"
-            )
-        except Exception as e:
-            logger.error(f"Take2 failed: {e}")
-            await self._send(f"⚠️ Тейк 2 не выставлен: `{e}`")
-
-    # ─────────────────────────────────────────────────────────────────────────
-    # ШАГ 4: тейк 2 исполнился — стоп на тейк 1 + тейк 3 (весь остаток)
-    # ─────────────────────────────────────────────────────────────────────────
-    async def _on_take2_filled(self, plan: Plan, fill_price: float):
-        plan.take2_price = fill_price
-        close_side       = "sell" if plan.side == "buy" else "buy"
-
-        # Считаем остаток: исходные - тейк1(50%) - тейк2(25%) = 25%
-        half            = plan.contracts // 2
-        remaining_after1 = max(1, plan.contracts - half)
-        quarter         = max(1, remaining_after1 // 2)
-        final_remaining = max(1, remaining_after1 - quarter)
-
-        take1 = plan.take1_price
-
-        if plan.side == "buy":
-            direction      = "down"
-            take3_price    = round(fill_price * (1 + plan.trim_pct / 100), 8)
-            take3_direction = "up"
-        else:
-            direction      = "up"
-            take3_price    = round(fill_price * (1 - plan.trim_pct / 100), 8)
-            take3_direction = "down"
-
-        # Отменяем текущий стоп (безубыток)
-        if plan.sl_order_id:
-            try:
-                await self.client.cancel_order(plan.sl_order_id)
-                logger.info(f"Cancelled SL {plan.sl_order_id}")
-            except Exception as e:
-                logger.warning(f"Cancel SL failed: {e}")
-            plan.sl_order_id = None
-
-        # Стоп на цену тейка 1
-        try:
-            data = await self.client.place_stop_market_close(
-                plan.symbol, close_side, final_remaining,
-                take1, direction, plan.leverage
-            )
-            plan.sl_order_id = data.get("orderId", "")
-            logger.info(f"Stop at take1: {plan.symbol} @ {take1} → {plan.sl_order_id}")
-            await self._send(
-                f"🎯 *Стоп перенесён на тейк 1*\n"
-                f"Символ: `{plan.symbol}`\n"
-                f"Тейк 2 исполнен по: `{fill_price}`\n"
-                f"Стоп на: `{take1}`\n"
-                f"Остаток: `{final_remaining}` контрактов\n"
-                f"ID: `{plan.sl_order_id}`"
-            )
-        except Exception as e:
-            logger.error(f"Stop at take1 failed: {e}")
-            await self._send(f"⚠️ Стоп не перенесён: `{e}`\nСтоп вручную на: `{take1}`")
-
-        # Тейк 3 — весь остаток при движении ещё на trim_pct%
-        try:
-            data = await self.client.place_stop_market_close(
-                plan.symbol, close_side, final_remaining,
-                take3_price, take3_direction, plan.leverage
-            )
-            plan.take3_order_id = data.get("orderId", "")
-            logger.info(f"Take3: {plan.symbol} {final_remaining}c @ {take3_price} → {plan.take3_order_id}")
-            await self._send(
-                f"✂️ *Тейк 3 выставлен (весь остаток)*\n"
-                f"Символ: `{plan.symbol}`\n"
-                f"Цена тейка 3: `{take3_price}` (`+{plan.trim_pct}%` от тейка 2)\n"
-                f"Контрактов: `{final_remaining}`\n"
-                f"ID: `{plan.take3_order_id}`"
-            )
-        except Exception as e:
-            logger.error(f"Take3 failed: {e}")
-            await self._send(f"⚠️ Тейк 3 не выставлен: `{e}`")
-
-    # ─────────────────────────────────────────────────────────────────────────
-    # ШАГ 5: тейк 3 исполнился — позиция закрыта полностью
-    # ─────────────────────────────────────────────────────────────────────────
-    async def _on_take3_filled(self, plan: Plan, fill_price: float):
-        close_side = "sell" if plan.side == "buy" else "buy"
-
-        # Отменяем стоп если остался
-        if plan.sl_order_id:
-            try:
-                await self.client.cancel_order(plan.sl_order_id)
-            except Exception:
-                pass  # ордер уже исполнился или не существует — ок
-            plan.sl_order_id = None
+        logger.info(f"Entry filled: {plan.symbol} {plan.side} @ {fill_price} "
+                    f"SL={plan.current_sl} TP={plan.current_tp} "
+                    f"stop_size={plan.stop_size} contracts={plan.contracts}")
 
         await self._send(
-            f"🏁 *Позиция закрыта полностью*\n"
-            f"Символ: `{plan.symbol}`\n"
-            f"Тейк 3 исполнен по: `{fill_price}`\n"
-            f"Все 3 тейка отработали ✅"
+            f"✅ *Вход исполнен — Фен-Шуй активирован*\n"
+            f"Символ: `{plan.symbol}` | `{'LONG 📈' if plan.side=='buy' else 'SHORT 📉'}`\n"
+            f"Цена входа: `{fill_price}`\n"
+            f"Контрактов: `{plan.contracts}`\n"
+            f"SL: `{plan.current_sl}` | TP: `{plan.current_tp}`\n"
+            f"Stop size: `{plan.stop_size}`\n"
+            f"Уровни: 1S=`{self._price_at_stops(plan, 1)}` "
+            f"2S=`{self._price_at_stops(plan, 2)}` "
+            f"3S=`{self._price_at_stops(plan, 3)}`"
         )
 
-        if plan.symbol in self._plans:
-            del self._plans[plan.symbol]
+        # Выставляем SL и TP на бирже
+        await self._update_orders(plan, "entry_filled")
 
-    # ─────────────────────────────────────────────────────────────────────────
-    # Ручной порез
-    # ─────────────────────────────────────────────────────────────────────────
+    # ═════════════════════════════════════════════════════════════════════════
+    #  МОНИТОРИНГ ЦЕНЫ — этапы Фен-Шуй
+    # ═════════════════════════════════════════════════════════════════════════
+
+    async def on_price_update(self, data: dict):
+        """Проверяем пройденные стопы для всех активных планов."""
+        symbol = data.get("symbol", "")
+        price  = data.get("price", 0)
+        if price is None:
+            return
+        price = float(price)
+        if price <= 0:
+            return
+
+        plan = self._plans.get(symbol)
+        if not plan or not plan.filled or plan.remaining <= 0:
+            return
+
+        if plan.stop_size <= 0:
+            return
+
+        # Считаем сколько стопов пройдено в сторону TP
+        if plan.side == "buy":
+            distance = price - plan.entry_price
+        else:
+            distance = plan.entry_price - price
+
+        if distance <= 0:
+            return  # цена не в нашу сторону
+
+        current_stops = int(distance / plan.stop_size)
+
+        if current_stops <= plan.stops_passed:
+            return  # новый уровень не достигнут
+
+        # Обрабатываем каждый пропущенный уровень
+        for level in range(plan.stops_passed + 1, current_stops + 1):
+            await self._handle_stop_level(plan, level, price)
+
+    async def _handle_stop_level(self, plan: Plan, level: int, current_price: float):
+        """Обработать достижение N-го уровня стопа."""
+        plan.stops_passed = level
+
+        logger.info(f"Feng Shui level {level}: {plan.symbol} price={current_price} "
+                    f"remaining={plan.remaining}")
+
+        if level == 1:
+            await self._level_1_breakeven(plan, current_price)
+        elif level == 2:
+            await self._level_2_first_cut(plan, current_price)
+        elif level == 3:
+            await self._level_3_second_cut(plan, current_price)
+        else:
+            await self._level_n_trail(plan, level, current_price)
+
+    # ── Уровень 1: Безубыток ─────────────────────────────────────────────────
+    async def _level_1_breakeven(self, plan: Plan, current_price: float):
+        """Прошли 1 стоп → SL на entry (безубыток)."""
+        plan.current_sl = plan.entry_price
+        # TP не меняется
+
+        await self._send(
+            f"🎯 *Уровень 1 — Безубыток*\n"
+            f"Символ: `{plan.symbol}` | Цена: `{current_price}`\n"
+            f"SL -> `{plan.current_sl}` (entry)\n"
+            f"TP: `{plan.current_tp}` (без изменений)\n"
+            f"Контрактов: `{plan.remaining}`"
+        )
+        await self._update_orders(plan, "level_1_breakeven")
+
+    # ── Уровень 2: Первый порез ──────────────────────────────────────────────
+    async def _level_2_first_cut(self, plan: Plan, current_price: float):
+        """Прошли 2 стопа → порез 50% от начального, углубление SL и TP."""
+        # Порез: ceil(начальный / 2)
+        cut = math.ceil(plan.contracts / 2)
+        cut = min(cut, plan.remaining)  # не больше чем есть
+
+        if cut > 0:
+            try:
+                data = await self.client.place_market_order(
+                    plan.symbol, self._close_side(plan), cut, plan.leverage
+                )
+                oid = data.get("orderId", "")
+                plan.remaining -= cut
+                logger.info(f"Cut 1: {plan.symbol} closed {cut}c, remaining={plan.remaining}")
+            except Exception as e:
+                logger.error(f"Cut 1 failed: {e}")
+                await self._send(f"⚠️ Порез 1 не удался: `{e}`")
+                return
+
+        # SL на entry + 1 * stop_size
+        if plan.side == "buy":
+            plan.current_sl = round(plan.entry_price + plan.stop_size, 8)
+            plan.current_tp = round(plan.current_tp + plan.stop_size, 8)
+        else:
+            plan.current_sl = round(plan.entry_price - plan.stop_size, 8)
+            plan.current_tp = round(plan.current_tp - plan.stop_size, 8)
+
+        await self._send(
+            f"✂️ *Уровень 2 — Первый порез*\n"
+            f"Символ: `{plan.symbol}` | Цена: `{current_price}`\n"
+            f"Закрыто: `{cut}` контрактов (50% от `{plan.contracts}`)\n"
+            f"Остаток: `{plan.remaining}`\n"
+            f"SL -> `{plan.current_sl}` (entry + 1 stop)\n"
+            f"TP -> `{plan.current_tp}` (+1 stop)"
+        )
+
+        if plan.remaining > 0:
+            await self._update_orders(plan, "level_2_cut")
+        else:
+            await self._cancel_safe(plan.sl_order_id)
+            await self._cancel_safe(plan.tp_order_id)
+            await self._send(f"🏁 Позиция `{plan.symbol}` закрыта полностью (порез 1)")
+            self._plans.pop(plan.symbol, None)
+
+    # ── Уровень 3: Второй порез ──────────────────────────────────────────────
+    async def _level_3_second_cut(self, plan: Plan, current_price: float):
+        """Прошли 3 стопа → порез 50% от остатка, углубление SL и TP."""
+        cut = math.ceil(plan.remaining / 2)
+        cut = min(cut, plan.remaining)
+
+        if cut > 0:
+            try:
+                data = await self.client.place_market_order(
+                    plan.symbol, self._close_side(plan), cut, plan.leverage
+                )
+                oid = data.get("orderId", "")
+                plan.remaining -= cut
+                logger.info(f"Cut 2: {plan.symbol} closed {cut}c, remaining={plan.remaining}")
+            except Exception as e:
+                logger.error(f"Cut 2 failed: {e}")
+                await self._send(f"⚠️ Порез 2 не удался: `{e}`")
+                return
+
+        # SL на entry + 2 * stop_size, TP + 1 * stop_size
+        if plan.side == "buy":
+            plan.current_sl = round(plan.entry_price + 2 * plan.stop_size, 8)
+            plan.current_tp = round(plan.current_tp + plan.stop_size, 8)
+        else:
+            plan.current_sl = round(plan.entry_price - 2 * plan.stop_size, 8)
+            plan.current_tp = round(plan.current_tp - plan.stop_size, 8)
+
+        await self._send(
+            f"✂️ *Уровень 3 — Второй порез*\n"
+            f"Символ: `{plan.symbol}` | Цена: `{current_price}`\n"
+            f"Закрыто: `{cut}` контрактов (50% от остатка)\n"
+            f"Остаток: `{plan.remaining}`\n"
+            f"SL -> `{plan.current_sl}` (entry + 2 stop)\n"
+            f"TP -> `{plan.current_tp}` (+1 stop)"
+        )
+
+        if plan.remaining > 0:
+            await self._update_orders(plan, "level_3_cut")
+        else:
+            await self._cancel_safe(plan.sl_order_id)
+            await self._cancel_safe(plan.tp_order_id)
+            await self._send(f"🏁 Позиция `{plan.symbol}` закрыта полностью (порез 2)")
+            self._plans.pop(plan.symbol, None)
+
+    # ── Уровень 4+: Только углубление ────────────────────────────────────────
+    async def _level_n_trail(self, plan: Plan, level: int, current_price: float):
+        """Прошли N стопов (N>=4) → углубляем SL и TP без порезов."""
+        if plan.side == "buy":
+            plan.current_sl = round(plan.entry_price + (level - 1) * plan.stop_size, 8)
+            plan.current_tp = round(plan.current_tp + plan.stop_size, 8)
+        else:
+            plan.current_sl = round(plan.entry_price - (level - 1) * plan.stop_size, 8)
+            plan.current_tp = round(plan.current_tp - plan.stop_size, 8)
+
+        await self._send(
+            f"📐 *Уровень {level} — Углубление*\n"
+            f"Символ: `{plan.symbol}` | Цена: `{current_price}`\n"
+            f"SL -> `{plan.current_sl}` (entry + {level-1} stop)\n"
+            f"TP -> `{plan.current_tp}` (+1 stop)\n"
+            f"Контрактов: `{plan.remaining}` | Порезов больше нет"
+        )
+        await self._update_orders(plan, f"level_{level}_trail")
+
+    # ═════════════════════════════════════════════════════════════════════════
+    #  РУЧНОЙ ПОРЕЗ
+    # ═════════════════════════════════════════════════════════════════════════
+
     async def partial_close(self, symbol: str, close_pct: float,
                             reason: str = "Ручной порез") -> Optional[str]:
         position = await self.client.get_position(symbol)
@@ -492,10 +517,15 @@ class OrderManager:
         except Exception:
             close_usdt = 0.0
 
-        data     = await self.client.place_market_order(symbol, close_side, 0, lev, _contracts=close_n)
+        data     = await self.client.place_market_order(symbol, close_side, close_n, lev)
         order_id = data.get("orderId", "")
 
-        logger.info(f"Partial close: {symbol} {close_pct}% → {close_n}/{int(current_qty)}c")
+        # Обновляем remaining в плане
+        plan = self._plans.get(symbol)
+        if plan:
+            plan.remaining = max(0, plan.remaining - close_n)
+
+        logger.info(f"Partial close: {symbol} {close_pct}% -> {close_n}/{int(current_qty)}c")
         usdt_str = f" (~`{close_usdt:.2f} USDT`)" if close_usdt else ""
         await self._send(
             f"✂️ *{reason}*\n"
@@ -505,11 +535,9 @@ class OrderManager:
         )
         return order_id
 
-    # ─────────────────────────────────────────────────────────────────────────
-    # WebSocket — исполнение ордеров
-    # ─────────────────────────────────────────────────────────────────────────
-    async def on_price_update(self, data: dict):
-        pass  # мониторинг не нужен — все ордера реальные на бирже
+    # ═════════════════════════════════════════════════════════════════════════
+    #  WebSocket — исполнение ордеров
+    # ═════════════════════════════════════════════════════════════════════════
 
     async def on_order_filled(self, data: dict):
         symbol   = data.get("symbol", "")
@@ -519,7 +547,6 @@ class OrderManager:
         order_id = data.get("orderId", "")
         status   = data.get("status", "")
 
-        # При match-событии цена может быть 0 — берём марк-цену как fallback
         if price <= 0:
             try:
                 price = await self.client.get_mark_price(symbol)
@@ -548,50 +575,42 @@ class OrderManager:
         if not plan:
             return
 
-        logger.info(f"Checking: event_id={order_id} status={status} price={price} "
-                    f"entry={plan.entry_order_id} take={plan.take_order_id} "
-                    f"take2={plan.take2_order_id} take3={plan.take3_order_id} "
-                    f"filled={plan.filled} taken={plan.taken} taken2={plan.taken2} taken3={plan.taken3}")
-
-        # Сравниваем orderId — WS может слать укороченный вариант
         def ids_match(a: str, b: str) -> bool:
             if not a or not b:
                 return False
             return a == b or a.startswith(b) or b.startswith(a)
 
-        # Лимитный/стоп-маркет/маркет вход исполнился → тейки + SL
+        # Вход исполнился
         if ids_match(plan.entry_order_id, order_id) and not plan.filled:
             plan.filled = True
-            # Берём реальную цену входа из позиции (точнее чем WS событие)
             try:
                 pos = await self.client.get_position(symbol)
                 if pos:
                     real_price = float(pos.get("avgEntryPrice", 0) or 0)
                     if real_price > 0:
-                        logger.info(f"Entry price from position: {real_price} (WS gave: {price})")
+                        logger.info(f"Entry price from position: {real_price} (WS: {price})")
                         price = real_price
             except Exception as e:
                 logger.warning(f"Could not fetch position price: {e}")
-            logger.info(f"Entry filled: {symbol} @ {price}")
             await self._on_entry_filled(plan, price)
 
-        # Тейк 1 — только при финальном done чтобы не задвоить
-        elif ids_match(plan.take_order_id, order_id) and not plan.taken:
-            plan.taken = True
-            logger.info(f"Take1 filled: {symbol} @ {price}")
-            await self._on_take_filled(plan, price)
+        # SL сработал
+        elif ids_match(plan.sl_order_id, order_id):
+            await self._send(
+                f"🛑 *Стоп-лосс сработал*\n"
+                f"Символ: `{plan.symbol}` | Цена: `{price}`\n"
+                f"Закрыто: `{plan.remaining}` контрактов"
+            )
+            self._plans.pop(symbol, None)
 
-        # Тейк 2
-        elif ids_match(plan.take2_order_id, order_id) and not plan.taken2:
-            plan.taken2 = True
-            logger.info(f"Take2 filled: {symbol} @ {price}")
-            await self._on_take2_filled(plan, price)
-
-        # Тейк 3
-        elif ids_match(plan.take3_order_id, order_id) and not plan.taken3:
-            plan.taken3 = True
-            logger.info(f"Take3 filled: {symbol} @ {price}")
-            await self._on_take3_filled(plan, price)
+        # TP сработал
+        elif ids_match(plan.tp_order_id, order_id):
+            await self._send(
+                f"🎯 *Тейк-профит сработал*\n"
+                f"Символ: `{plan.symbol}` | Цена: `{price}`\n"
+                f"Закрыто: `{plan.remaining}` контрактов"
+            )
+            self._plans.pop(symbol, None)
 
     async def on_trailing_stop_triggered(self, data: dict):
         symbol = data.get("symbol", "")
@@ -616,9 +635,10 @@ class OrderManager:
             f"Цена входа: `{price}`"
         )
 
-    # ─────────────────────────────────────────────────────────────────────────
-    # Отмена
-    # ─────────────────────────────────────────────────────────────────────────
+    # ═════════════════════════════════════════════════════════════════════════
+    #  ОТМЕНА
+    # ═════════════════════════════════════════════════════════════════════════
+
     async def cancel_order(self, order_id: str) -> bool:
         try:
             await self.client.cancel_order(order_id)
