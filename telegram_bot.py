@@ -617,7 +617,8 @@ class TradingBot:
                 f"Триггер: {direction} `{price}`\n"
                 f"Объём: `{usdt_amount} USDT` | Плечо: `{alert.leverage}x`\n"
                 f"SL: `{sl_price}` | Stop size: `{stop_size}`{tp_str}\n\n"
-                f"_Мониторинг запущен. При достижении — автовход + сопровождение._",
+                f"_Мониторинг запущен. При достижении — автовход + сопровождение._\n"
+                f"_Отмена:_ `/rmalert {alert.id}`",
                 parse_mode=ParseMode.MARKDOWN
             )
         except Exception as e:

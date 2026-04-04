@@ -1,17 +1,4 @@
 {
   "next_id": 53,
-  "alerts": [
-    {
-      "id": 52,
-      "symbol": "AIOTUSDTM",
-      "trigger_price": 0.03172,
-      "side": "buy",
-      "usdt_amount": 9.0,
-      "sl_price": 0.03022,
-      "trim_pct": 0,
-      "leverage": 10,
-      "fired": false,
-      "direction": "down"
-    }
-  ]
+  "alerts": []
 }

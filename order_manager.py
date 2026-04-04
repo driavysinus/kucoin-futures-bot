@@ -351,6 +351,38 @@ class OrderManager:
 
     async def _handle_stop_level(self, plan: Plan, level: int, current_price: float):
         """Обработать достижение N-го уровня стопа."""
+
+        # Проверяем что позиция реально существует на бирже
+        try:
+            position = await self.client.get_position(plan.symbol)
+            if not position or float(position.get("currentQty", 0)) == 0:
+                logger.warning(f"Feng Shui level {level}: position {plan.symbol} "
+                               f"not found on exchange — removing plan")
+                await self._send(
+                    f"⚠️ *Позиция `{plan.symbol}` не найдена на бирже*\n"
+                    f"Сопровождение остановлено. Отменяю SL/TP."
+                )
+                await self._cancel_safe(plan.sl_order_id)
+                await self._cancel_safe(plan.tp_order_id)
+                self._plans.pop(plan.symbol, None)
+                return
+
+            # Синхронизируем remaining с реальным объёмом
+            real_qty = abs(float(position.get("currentQty", 0)))
+            if int(real_qty) != plan.remaining:
+                logger.info(f"Sync remaining: plan={plan.remaining} -> exchange={int(real_qty)}")
+                plan.remaining = int(real_qty)
+
+            if plan.remaining <= 0:
+                await self._cancel_safe(plan.sl_order_id)
+                await self._cancel_safe(plan.tp_order_id)
+                self._plans.pop(plan.symbol, None)
+                return
+
+        except Exception as e:
+            logger.error(f"Position check failed: {e}")
+            # Не останавливаем — пусть продолжит, возможно временная ошибка API
+
         plan.stops_passed = level
 
         logger.info(f"Feng Shui level {level}: {plan.symbol} price={current_price} "
