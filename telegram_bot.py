@@ -185,6 +185,7 @@ class TradingBot:
             "`/leverage SYMBOL VALUE` — плечо\n\n"
 
             "*Алерты:*\n"
+            "`/notify SYMBOL PRICE` — уведомление при цене (без сделки)\n"
             "`/alerts` — список\n"
             "`/rmalert ID` — удалить\n"
             "`/clearalerts` — удалить все\n\n"
@@ -625,6 +626,51 @@ class TradingBot:
             await update.message.reply_text(f"❌ Ошибка: {e}")
 
     @restricted
+    async def cmd_notify(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        """
+        /notify SYMBOL PRICE — уведомление при достижении цены (без сделки).
+        """
+        self._register_chat(update)
+        args = ctx.args
+        if len(args) < 2:
+            await update.message.reply_text(
+                "❌ Использование:\n"
+                "`/notify SYMBOL PRICE`\n\n"
+                "Пример:\n"
+                "`/notify XMR 330` — уведомить когда XMR достигнет 330",
+                parse_mode=ParseMode.MARKDOWN
+            )
+            return
+
+        try:
+            symbol = args[0].upper()
+            if symbol.endswith("USDTM"):
+                pass
+            elif symbol.endswith("USDT"):
+                symbol += "M"
+            else:
+                symbol += "USDTM"
+
+            price = _float(args[1])
+
+            alert = await self.alert_manager.add_notify_alert(
+                symbol=symbol,
+                trigger_price=price,
+            )
+
+            direction = "📉 ждём падения до" if alert.direction == "down" else "📈 ждём роста до"
+            await update.message.reply_text(
+                f"✅ *Уведомление #{alert.id}*\n"
+                f"Символ: `{alert.symbol}`\n"
+                f"Триггер: {direction} `{price}`\n\n"
+                f"_При достижении цены — уведомление в Telegram (без сделки)._\n"
+                f"_Отмена:_ `/rmalert {alert.id}`",
+                parse_mode=ParseMode.MARKDOWN
+            )
+        except Exception as e:
+            await update.message.reply_text(f"❌ Ошибка: {e}")
+
+    @restricted
     async def cmd_rmalert(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         """Usage: /rmalert ID — удалить алерт"""
         self._register_chat(update)
@@ -668,21 +714,29 @@ class TradingBot:
         alerts = self.alert_manager.list_alerts()
         if not alerts:
             await update.message.reply_text("📭 Нет активных алертов\n"
-                                             "Добавьте: `/alert SYMBOL PRICE SIDE USDT SL LEV`",
+                                             "Торговый: `/alert SYMBOL PRICE SIDE USDT SL LEV`\n"
+                                             "Уведомление: `/notify SYMBOL PRICE`",
                                              parse_mode=ParseMode.MARKDOWN)
             return
 
         lines = [f"*🔔 Активные алерты ({len(alerts)}):*\n"]
         for a in alerts:
             direction = "📉 падение до" if a.direction == "down" else "📈 рост до"
-            stop_size = abs(a.trigger_price - a.sl_price) if a.sl_price > 0 else 0
-            sl_str = f" | SL: `{a.sl_price}`" if a.sl_price > 0 else ""
-            stop_str = f" | Stop: `{stop_size}`" if stop_size > 0 else ""
-            lines.append(
-                f"*#{a.id}* `{a.symbol}` {a.side.upper()}\n"
-                f"  {direction} `{a.trigger_price}`{sl_str}{stop_str}\n"
-                f"  Объём: `{a.usdt_amount} USDT` | Плечо: `{a.leverage}x`\n"
-            )
+
+            if a.alert_type == "notify":
+                lines.append(
+                    f"*#{a.id}* `{a.symbol}` 🔔 УВЕДОМЛЕНИЕ\n"
+                    f"  {direction} `{a.trigger_price}`\n"
+                )
+            else:
+                stop_size = abs(a.trigger_price - a.sl_price) if a.sl_price > 0 else 0
+                sl_str = f" | SL: `{a.sl_price}`" if a.sl_price > 0 else ""
+                stop_str = f" | Stop: `{stop_size}`" if stop_size > 0 else ""
+                lines.append(
+                    f"*#{a.id}* `{a.symbol}` {a.side.upper()}\n"
+                    f"  {direction} `{a.trigger_price}`{sl_str}{stop_str}\n"
+                    f"  Объём: `{a.usdt_amount} USDT` | Плечо: `{a.leverage}x`\n"
+                )
         await update.message.reply_text(
             "\n".join(lines), parse_mode=ParseMode.MARKDOWN
         )
@@ -827,6 +881,7 @@ class TradingBot:
         app.add_handler(CommandHandler("leverage",  self.cmd_leverage))
         app.add_handler(CommandHandler("price",     self.cmd_price))
         app.add_handler(CommandHandler("alert",     self.cmd_alert))
+        app.add_handler(CommandHandler("notify",    self.cmd_notify))
         app.add_handler(CommandHandler("alerts",    self.cmd_alerts))
         app.add_handler(CommandHandler("rmalert",   self.cmd_rmalert))
         app.add_handler(CommandHandler("clearalerts", self.cmd_clearalerts))

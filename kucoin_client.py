@@ -148,6 +148,21 @@ class KuCoinFuturesClient:
         }
         return await self._request("POST", "/api/v1/orders", body=body)
 
+    async def place_market_close(self, symbol: str, side: str, size: float,
+                                  leverage: int) -> dict:
+        """Маркет-ордер на ЗАКРЫТИЕ позиции (reduceOnly)."""
+        body = {
+            "clientOid":  uuid.uuid4().hex,
+            "symbol":     symbol,
+            "side":       side,
+            "type":       "market",
+            "size":       int(size),
+            "leverage":   str(leverage),
+            "marginMode": config.MARGIN_MODE,
+            "reduceOnly": True,
+        }
+        return await self._request("POST", "/api/v1/orders", body=body)
+
     async def place_trailing_stop_order(self, symbol: str, side: str,
                                         size: float, callback_rate: float,
                                         leverage: int,

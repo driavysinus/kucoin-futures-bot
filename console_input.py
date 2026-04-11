@@ -70,6 +70,8 @@ class ConsoleInput:
             self._print_help()
 
         # ── Алерты ────────────────────────────────────────────────────────
+        elif cmd == "notify":
+            await self._cmd_notify(parts[1:])
         elif cmd == "add":
             await self._cmd_add(parts[1:])
         elif cmd == "list":
@@ -101,6 +103,30 @@ class ConsoleInput:
     # ══════════════════════════════════════════════════════════════════════
     #  АЛЕРТЫ
     # ══════════════════════════════════════════════════════════════════════
+
+    async def _cmd_notify(self, args: list):
+        """notify SYMBOL PRICE — уведомление при достижении цены."""
+        if len(args) < 2:
+            print("  ❌ Использование: notify SYMBOL PRICE")
+            print("  Пример: notify XMR 330")
+            return
+
+        try:
+            symbol = args[0].upper()
+            if not symbol.endswith("USDTM"):
+                symbol = symbol.rstrip("USDT") + "USDTM" if symbol.endswith("USDT") else symbol + "USDTM"
+
+            price = float(args[1].replace(",", "."))
+
+            alert = await self.alert_manager.add_notify_alert(symbol, price)
+            direction_emoji = "📉" if alert.direction == "down" else "📈"
+            print(
+                f"  ✅ Уведомление #{alert.id} добавлено\n"
+                f"     {symbol} {direction_emoji} @ {price}\n"
+                f"     Только уведомление (без сделки)"
+            )
+        except (ValueError, IndexError) as e:
+            print(f"  ❌ Ошибка: {e}")
 
     async def _cmd_add(self, args: list):
         """add SYMBOL PRICE SIDE USDT [SL] [TRIG%] [LEV]"""
@@ -169,9 +195,14 @@ class ConsoleInput:
         print(f"  {'─'*4}  {'─'*14} {'─'*6} {'─'*12} {'─'*8} {'─'*10} {'─'*6} {'─'*4}")
 
         for a in alerts:
-            sl_str = str(a.sl_price) if a.sl_price > 0 else "—"
-            print(f"  {a.id:>4}  {a.symbol:<14} {a.side:<6} {a.trigger_price:>12} "
-                  f"{a.usdt_amount:>8} {sl_str:>10} {a.trim_pct:>6} {a.leverage:>4}x")
+            if a.alert_type == "notify":
+                dir_emoji = "📉" if a.direction == "down" else "📈"
+                print(f"  {a.id:>4}  {a.symbol:<14} {'🔔':>6} {a.trigger_price:>12} "
+                      f"{'—':>8} {'—':>10} {'—':>6} {'—':>5}  {dir_emoji} уведомление")
+            else:
+                sl_str = str(a.sl_price) if a.sl_price > 0 else "—"
+                print(f"  {a.id:>4}  {a.symbol:<14} {a.side:<6} {a.trigger_price:>12} "
+                      f"{a.usdt_amount:>8} {sl_str:>10} {a.trim_pct:>6} {a.leverage:>4}x")
 
     def _cmd_remove(self, args: list):
         if not args:
@@ -401,6 +432,7 @@ class ConsoleInput:
   ║    add ETHUSDTM 4000 sell 50 4200 1.5 5                        ║
   ║    add BTC 95000 buy 20 93000 1 3                              ║
   ║                                                                ║
+  ║  notify SYMBOL PRICE — уведомление при цене (без сделки)        ║
   ║  list               — показать активные алерты                 ║
   ║  remove ID          — удалить алерт по номеру                  ║
   ║  clear [SYMBOL]     — удалить все алерты (или по символу)      ║

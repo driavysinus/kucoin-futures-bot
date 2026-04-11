@@ -83,11 +83,11 @@ class OrderManager:
             return round(plan.entry_price - n_stops * plan.stop_size, 8)
 
     async def _close_position_market(self, plan: Plan, size: int, reason: str) -> Optional[str]:
-        """Закрыть часть позиции маркет-ордером."""
+        """Закрыть часть позиции маркет-ордером (reduceOnly)."""
         if size <= 0:
             return None
         try:
-            data = await self.client.place_market_order(
+            data = await self.client.place_market_close(
                 plan.symbol, self._close_side(plan), size, plan.leverage
             )
             oid = data.get("orderId", "")
@@ -321,6 +321,55 @@ class OrderManager:
                 return
             await self._handle_stop_level(plan, level, price)
 
+    # ── Верификация закрытия позиции ────────────────────────────────────────
+    async def _verify_position_closed(self, plan: Plan, reason: str) -> bool:
+        """
+        Проверяет, что позиция реально закрыта на бирже.
+        Если нет — повторяет маркет-ордер до 3 раз.
+        Возвращает True если позиция закрыта.
+        """
+        for attempt in range(3):
+            await asyncio.sleep(0.5 + attempt * 0.5)
+            try:
+                position = await self.client.get_position(plan.symbol)
+                if not position:
+                    logger.info(f"{reason} verified: position {plan.symbol} closed")
+                    return True
+                real_qty = abs(float(position.get("currentQty", 0)))
+                if real_qty == 0:
+                    logger.info(f"{reason} verified: position {plan.symbol} qty=0")
+                    return True
+
+                # Позиция всё ещё открыта — повторяем
+                logger.warning(f"{reason} attempt {attempt+1}: {plan.symbol} still has "
+                               f"{int(real_qty)} contracts, retrying close...")
+                await self._send(
+                    f"⚠️ *Повторное закрытие (попытка {attempt+2})*\n"
+                    f"Символ: `{plan.symbol}` | Осталось: `{int(real_qty)}` контрактов"
+                )
+                await self._close_position_market(plan, int(real_qty), f"{reason} retry")
+
+            except Exception as e:
+                logger.error(f"{reason} verify attempt {attempt+1} failed: {e}")
+
+        # Финальная проверка
+        await asyncio.sleep(1)
+        try:
+            position = await self.client.get_position(plan.symbol)
+            if not position or abs(float(position.get("currentQty", 0))) == 0:
+                return True
+            remaining = abs(float(position.get("currentQty", 0)))
+            logger.error(f"{reason}: FAILED to close {plan.symbol} after 3 retries, "
+                         f"{int(remaining)} contracts remain!")
+            await self._send(
+                f"🚨 *КРИТИЧНО: позиция `{plan.symbol}` НЕ ЗАКРЫТА!*\n"
+                f"Осталось: `{int(remaining)}` контрактов\n"
+                f"Закройте вручную командой `/close {plan.symbol}`"
+            )
+            return False
+        except Exception:
+            return False
+
     # ── Исполнение SL через маркет ───────────────────────────────────────────
     async def _execute_sl(self, plan: Plan, price: float):
         logger.info(f"SL triggered (WS): {plan.symbol} price={price} sl={plan.current_sl}")
@@ -334,6 +383,9 @@ class OrderManager:
             f"Закрыто: `{plan.remaining}` контрактов по рынку\n"
             f"ID: `{oid}`"
         )
+
+        # Верификация: убеждаемся что позиция реально закрыта
+        await self._verify_position_closed(plan, "SL")
         self._plans.pop(plan.symbol, None)
 
     # ── Исполнение TP через маркет ───────────────────────────────────────────
@@ -349,6 +401,9 @@ class OrderManager:
             f"Закрыто: `{plan.remaining}` контрактов по рынку\n"
             f"ID: `{oid}`"
         )
+
+        # Верификация: убеждаемся что позиция реально закрыта
+        await self._verify_position_closed(plan, "TP")
         self._plans.pop(plan.symbol, None)
 
     # ═════════════════════════════════════════════════════════════════════════

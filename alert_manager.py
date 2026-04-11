@@ -31,6 +31,7 @@ class Alert:
     trim_pct:    float        # % для тейков
     leverage:    int
     fired:       bool = False
+    alert_type:  str = "trade"  # "trade" — открытие сделки, "notify" — только уведомление
 
     # Направление ожидания цены:
     #   "down" — ждём когда цена УПАДЁТ до trigger_price (price <= trigger)
@@ -97,12 +98,13 @@ class AlertManager:
                     id=item["id"],
                     symbol=item["symbol"],
                     trigger_price=item["trigger_price"],
-                    side=item["side"],
-                    usdt_amount=item["usdt_amount"],
-                    sl_price=item["sl_price"],
-                    trim_pct=item["trim_pct"],
-                    leverage=item["leverage"],
+                    side=item.get("side", ""),
+                    usdt_amount=item.get("usdt_amount", 0),
+                    sl_price=item.get("sl_price", 0),
+                    trim_pct=item.get("trim_pct", 0),
+                    leverage=item.get("leverage", 10),
                     fired=False,
+                    alert_type=item.get("alert_type", "trade"),
                     direction=item.get("direction", ""),
                 )
                 # Fallback для старых алертов без direction
@@ -188,6 +190,51 @@ class AlertManager:
         self._save_alerts()
         return alert
 
+    async def add_notify_alert(self, symbol: str, trigger_price: float) -> Alert:
+        """Добавить уведомительный алерт — только сообщение в Telegram при достижении цены."""
+        # Проверяем что фьючерсная пара существует на KuCoin
+        try:
+            info = await self.order_manager.client.get_contract_info(symbol)
+            if not info or not info.get("symbol"):
+                raise ValueError(f"Контракт `{symbol}` не найден на KuCoin Futures")
+        except RuntimeError as e:
+            raise ValueError(f"Контракт `{symbol}` не существует на KuCoin Futures: {e}")
+
+        # Получаем текущую цену для определения направления
+        try:
+            current_price = await self.order_manager.client.get_mark_price(symbol)
+        except Exception:
+            current_price = 0
+
+        if current_price > 0:
+            direction = "down" if trigger_price < current_price else "up"
+        else:
+            direction = "up"
+
+        alert = Alert(
+            id=self._next_id,
+            symbol=symbol,
+            trigger_price=trigger_price,
+            side="",
+            usdt_amount=0,
+            sl_price=0,
+            trim_pct=0,
+            leverage=0,
+            alert_type="notify",
+            direction=direction,
+        )
+        self._alerts[self._next_id] = alert
+        self._next_id += 1
+
+        self.monitor.subscribe_ticker(symbol)
+
+        dir_label = "📉 ждём падения" if direction == "down" else "📈 ждём роста"
+        price_str = f" (текущая: {current_price})" if current_price > 0 else ""
+        logger.info(f"Notify alert #{alert.id} added: {symbol} @ {trigger_price} "
+                    f"direction={direction}{price_str}")
+        self._save_alerts()
+        return alert
+
     def remove_alert(self, alert_id: int) -> Optional[Alert]:
         """Удалить алерт по ID."""
         alert = self._alerts.pop(alert_id, None)
@@ -249,11 +296,23 @@ class AlertManager:
                 asyncio.create_task(self._execute_alert(alert, price))
 
     async def _execute_alert(self, alert: Alert, current_price: float):
-        """Исполнить алерт: маркет-ордер + полная логика тейков/SL."""
+        """Исполнить алерт: уведомление или маркет-ордер + логика тейков/SL."""
         try:
-            logger.info(f"🔔 Alert #{alert.id} TRIGGERED: {alert.symbol} {alert.side} "
-                        f"@ {current_price} (trigger was {alert.trigger_price})")
+            logger.info(f"🔔 Alert #{alert.id} TRIGGERED: {alert.symbol} "
+                        f"type={alert.alert_type} @ {current_price} "
+                        f"(trigger was {alert.trigger_price})")
 
+            # Уведомительный алерт — только сообщение
+            if alert.alert_type == "notify":
+                await self._send(
+                    f"🔔 *Уведомление #{alert.id}*\n"
+                    f"Символ: `{alert.symbol}`\n"
+                    f"Цена достигла: `{current_price}`\n"
+                    f"Уровень: `{alert.trigger_price}`"
+                )
+                return
+
+            # Торговый алерт — маркет-ордер
             await self._send(
                 f"🔔 *Алерт #{alert.id} сработал!*\n"
                 f"Символ: `{alert.symbol}`\n"
