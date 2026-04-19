@@ -17,11 +17,18 @@ import websockets
 from kucoin_client import KuCoinFuturesClient
 
 
+# ── Health-check / REST-fallback константы ───────────────────────────────────
+WS_READ_TIMEOUT       = 30   # сек тишины на recv() → форс реконнект
+REST_FALLBACK_SILENCE = 10   # сек без WS-апдейтов по символу → REST-опрос
+WATCHDOG_INTERVAL     = 5    # период проверки watchdog
+
+
 class FuturesMonitor:
     def __init__(self, client: KuCoinFuturesClient):
         self.client   = client
         self._handlers: dict[str, list[Callable]] = {}
         self._price_cache: dict[str, float] = {}        # symbol → last price
+        self._last_price_ts: dict[str, float] = {}      # symbol → ts последнего апдейта
         self._ws_private  = None
         self._ws_public   = None
         self._running     = False
@@ -50,11 +57,15 @@ class FuturesMonitor:
         self._running = True
         if symbols:
             self._subscribed_tickers = set(symbols)
+            now = time.time()
+            for s in symbols:
+                self._last_price_ts.setdefault(s, now)
         try:
             await asyncio.gather(
                 self._run_private_ws(),
                 self._run_public_ws(),
                 self._dynamic_subscribe_loop(),
+                self._price_watchdog(),
             )
         except asyncio.CancelledError:
             logger.info("Monitor stopped.")
@@ -67,6 +78,9 @@ class FuturesMonitor:
         if symbol in self._subscribed_tickers:
             return
         self._subscribed_tickers.add(symbol)
+        # Инициализируем timestamp, чтобы watchdog не выстрелил REST-запросом
+        # сразу после подписки, а дал WS шанс прислать первую цену.
+        self._last_price_ts[symbol] = time.time()
         # Если WS уже живой — подписываем прямо сейчас через asyncio task
         ws = self._ws_public
         if ws is not None and symbol not in self._active_subscriptions:
@@ -145,7 +159,17 @@ class FuturesMonitor:
                         self._pinger(ws, ping_interval)
                     )
                     try:
-                        async for raw in ws:
+                        while True:
+                            try:
+                                raw = await asyncio.wait_for(
+                                    ws.recv(), timeout=WS_READ_TIMEOUT
+                                )
+                            except asyncio.TimeoutError:
+                                logger.warning(
+                                    f"Private WS silent {WS_READ_TIMEOUT}s — "
+                                    f"forcing reconnect"
+                                )
+                                raise
                             await self._handle_private_msg(json.loads(raw))
                     finally:
                         ping_task.cancel()
@@ -218,7 +242,17 @@ class FuturesMonitor:
                         self._pinger(ws, ping_interval)
                     )
                     try:
-                        async for raw in ws:
+                        while True:
+                            try:
+                                raw = await asyncio.wait_for(
+                                    ws.recv(), timeout=WS_READ_TIMEOUT
+                                )
+                            except asyncio.TimeoutError:
+                                logger.warning(
+                                    f"Public WS silent {WS_READ_TIMEOUT}s — "
+                                    f"forcing reconnect"
+                                )
+                                raise
                             await self._handle_public_msg(json.loads(raw))
                     finally:
                         ping_task.cancel()
@@ -249,10 +283,15 @@ class FuturesMonitor:
 
         if "/tickerV2:" in topic:
             symbol = topic.split(":")[-1]
-            price  = float(data.get("bestBidPrice", 0) or
-                           data.get("price", 0))
+            # Fallback bid → ask → price, чтобы не пропускать тики
+            # с пустой стороной BBO (бывает на низколиквидных альтах).
+            bid = float(data.get("bestBidPrice", 0) or 0)
+            ask = float(data.get("bestAskPrice", 0) or 0)
+            price = bid if bid > 0 else (ask if ask > 0
+                                         else float(data.get("price", 0) or 0))
             if price > 0:
                 self._price_cache[symbol] = price
+                self._last_price_ts[symbol] = time.time()
                 emit_data = dict(data)
                 emit_data["symbol"] = symbol
                 emit_data["price"]  = price
@@ -269,3 +308,41 @@ class FuturesMonitor:
                 }))
             except Exception:
                 break
+
+    # ── REST-fallback watchdog ────────────────────────────────────────────────
+    async def _price_watchdog(self):
+        """
+        Если по символу нет WS-апдейтов дольше REST_FALLBACK_SILENCE сек —
+        дёргаем mark-price через REST и сами эмитим price_update.
+        Это страховка на случай залипания WS или потери подписки.
+        В нормальном режиме (WS жив) запросов нет.
+        """
+        while self._running:
+            try:
+                await asyncio.sleep(WATCHDOG_INTERVAL)
+                now = time.time()
+                for symbol in list(self._subscribed_tickers):
+                    last = self._last_price_ts.get(symbol, 0)
+                    silence = now - last
+                    if silence < REST_FALLBACK_SILENCE:
+                        continue  # WS живой по этому символу
+                    try:
+                        price = await self.client.get_mark_price(symbol)
+                        if price > 0:
+                            self._price_cache[symbol] = price
+                            self._last_price_ts[symbol] = time.time()
+                            logger.warning(
+                                f"REST fallback {symbol}: WS silent {int(silence)}s, "
+                                f"mark={price}"
+                            )
+                            await self._emit("price_update", {
+                                "symbol": symbol,
+                                "price":  price,
+                                "source": "rest_fallback",
+                            })
+                    except Exception as e:
+                        logger.error(f"REST fallback failed for {symbol}: {e}")
+            except asyncio.CancelledError:
+                return
+            except Exception as e:
+                logger.error(f"Price watchdog error: {e}")
