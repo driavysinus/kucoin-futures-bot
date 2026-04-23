@@ -71,6 +71,16 @@ def _float(s: str) -> float:
     return float(str(s).replace(",", "."))
 
 
+def _symbol(s: str) -> str:
+    """Нормализует futures symbol: XMR / XMRUSDT -> XMRUSDTM."""
+    symbol = str(s).strip().upper()
+    if symbol.endswith("USDTM"):
+        return symbol
+    if symbol.endswith("USDT"):
+        return symbol + "M"
+    return symbol + "USDTM"
+
+
 CHAT_IDS_FILE = "chat_ids.json"
 
 
@@ -241,7 +251,7 @@ class TradingBot:
     @restricted
     async def cmd_orders(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         self._register_chat(update)
-        symbol = _parse(ctx.args, 0)
+        symbol = _symbol(ctx.args[0]) if ctx.args else None
         try:
             orders = await self.client.get_open_orders(symbol)
             if not orders:
@@ -300,7 +310,7 @@ class TradingBot:
                 parse_mode=ParseMode.MARKDOWN
             )
             return
-        symbol = args[0].upper()
+        symbol = _symbol(args[0])
         side   = args[1].lower()
         if side not in ("buy", "sell"):
             await update.message.reply_text("❌ SIDE должен быть `buy` или `sell`",
@@ -343,7 +353,7 @@ class TradingBot:
                 parse_mode=ParseMode.MARKDOWN
             )
             return
-        symbol = args[0].upper()
+        symbol = _symbol(args[0])
         side   = args[1].lower()
         if side not in ("buy", "sell"):
             await update.message.reply_text("❌ SIDE должен быть `buy` или `sell`",
@@ -378,7 +388,7 @@ class TradingBot:
                 parse_mode=ParseMode.MARKDOWN
             )
             return
-        symbol = args[0].upper()
+        symbol = _symbol(args[0])
         side   = args[1].lower()
         try:
             usdt_amount = _float(args[2])
@@ -430,7 +440,7 @@ class TradingBot:
                 parse_mode=ParseMode.MARKDOWN
             )
             return
-        symbol = args[0].upper()
+        symbol = _symbol(args[0])
         side   = args[1].lower()
         if side not in ("buy", "sell"):
             await update.message.reply_text("❌ SIDE должен быть `buy` или `sell`",
@@ -472,7 +482,7 @@ class TradingBot:
                 parse_mode=ParseMode.MARKDOWN
             )
             return
-        symbol    = args[0].upper()
+        symbol    = _symbol(args[0])
         close_pct = _parse(args, 1, float, config.DEFAULT_PARTIAL_CLOSE_PCT)
         try:
             await self.manager.partial_close(symbol, close_pct, "Ручной порез")
@@ -497,7 +507,7 @@ class TradingBot:
             await update.message.reply_text("❌ Использование: `/cancelall SYMBOL`",
                                              parse_mode=ParseMode.MARKDOWN)
             return
-        await self.manager.cancel_all(ctx.args[0].upper())
+        await self.manager.cancel_all(_symbol(ctx.args[0]))
 
     @restricted
     async def cmd_leverage(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -511,7 +521,7 @@ class TradingBot:
                 parse_mode=ParseMode.MARKDOWN
             )
             return
-        symbol = args[0].upper()
+        symbol = _symbol(args[0])
         lev    = int(args[1])
         self.manager.set_leverage(symbol, lev)
         await update.message.reply_text(
@@ -527,7 +537,7 @@ class TradingBot:
             await update.message.reply_text("❌ Использование: `/price SYMBOL`",
                                              parse_mode=ParseMode.MARKDOWN)
             return
-        symbol = ctx.args[0].upper()
+        symbol = _symbol(ctx.args[0])
         try:
             # Try WebSocket cache first (fast)
             price = self.monitor.get_price(symbol)
@@ -570,14 +580,7 @@ class TradingBot:
             return
 
         try:
-            symbol      = args[0].upper()
-            if symbol.endswith("USDTM"):
-                pass
-            elif symbol.endswith("USDT"):
-                symbol += "M"
-            else:
-                symbol += "USDTM"
-
+            symbol      = _symbol(args[0])
             price       = _float(args[1])
             side        = args[2].lower()
             usdt_amount = _float(args[3])
@@ -643,14 +646,7 @@ class TradingBot:
             return
 
         try:
-            symbol = args[0].upper()
-            if symbol.endswith("USDTM"):
-                pass
-            elif symbol.endswith("USDT"):
-                symbol += "M"
-            else:
-                symbol += "USDTM"
-
+            symbol = _symbol(args[0])
             price = _float(args[1])
 
             alert = await self.alert_manager.add_notify_alert(
@@ -696,7 +692,7 @@ class TradingBot:
     async def cmd_clearalerts(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         """Usage: /clearalerts [SYMBOL] — удалить все алерты"""
         self._register_chat(update)
-        symbol = ctx.args[0].upper() if ctx.args else None
+        symbol = _symbol(ctx.args[0]) if ctx.args else None
         before = len(self.alert_manager.list_alerts())
         self.alert_manager.clear_alerts(symbol)
         after = len(self.alert_manager.list_alerts())
@@ -772,13 +768,7 @@ class TradingBot:
             )
             return
 
-        symbol = ctx.args[0].upper()
-        if symbol.endswith("USDTM"):
-            pass
-        elif symbol.endswith("USDT"):
-            symbol += "M"
-        else:
-            symbol += "USDTM"
+        symbol = _symbol(ctx.args[0])
 
         try:
             # Получаем 25 дневных свечей (22 нужно для ATR21 + запас)
