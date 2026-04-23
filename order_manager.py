@@ -12,13 +12,18 @@ SL и TP НЕ выставляются на бирже. Мониторинг ч�
 """
 
 import asyncio
+import json
 import math
-from dataclasses import dataclass
+import os
+from dataclasses import asdict, dataclass
 from typing import Optional, Callable
 from loguru import logger
 
 from kucoin_client import KuCoinFuturesClient
 import config
+
+
+PLANS_FILE = "plans.json"
 
 
 @dataclass
@@ -55,12 +60,207 @@ class OrderManager:
         self._notify  = notify or (lambda msg: None)
         self._plans:    dict[str, Plan] = {}
         self._leverage: dict[str, int] = {}
+        self._load_plans()
 
     def set_leverage(self, symbol: str, lev: int):
         self._leverage[symbol] = lev
 
     def get_leverage(self, symbol: str) -> int:
         return self._leverage.get(symbol, config.DEFAULT_LEVERAGE)
+
+    def get_plan_symbols(self) -> list[str]:
+        return list(self._plans.keys())
+
+    # ─── Persistence ─────────────────────────────────────────────────────────
+
+    def _save_plans(self):
+        """Сохранить активные планы сопровождения на диск."""
+        try:
+            plans = []
+            for plan in self._plans.values():
+                if plan.filled and plan.remaining <= 0:
+                    continue
+                item = asdict(plan)
+                # Эти флаги защищают только текущий процесс от дублей.
+                # После рестарта открытая позиция должна снова проверяться.
+                item["sl_triggered"] = False
+                item["tp_triggered"] = False
+                plans.append(item)
+
+            data = {
+                "version": 1,
+                "plans": plans,
+            }
+            tmp_file = f"{PLANS_FILE}.tmp"
+            with open(tmp_file, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+                f.write("\n")
+            os.replace(tmp_file, PLANS_FILE)
+            logger.debug(f"Saved {len(plans)} plans to {PLANS_FILE}")
+        except Exception as e:
+            logger.error(f"Failed to save plans to {PLANS_FILE}: {e}")
+
+    def _load_plans(self):
+        """Загрузить планы сопровождения после рестарта."""
+        if not os.path.exists(PLANS_FILE):
+            return
+
+        try:
+            with open(PLANS_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+
+            items = data.get("plans", []) if isinstance(data, dict) else data
+            loaded = 0
+            for item in items:
+                try:
+                    symbol = str(item["symbol"]).upper()
+                    side = str(item["side"]).lower()
+                    contracts = int(float(item["contracts"]))
+                    initial_sl = float(item["initial_sl"])
+                    entry_price = float(item["entry_price"])
+                    stop_size = float(item.get("stop_size", abs(entry_price - initial_sl)))
+                    remaining = int(float(item.get("remaining", contracts)))
+
+                    plan = Plan(
+                        symbol=symbol,
+                        side=side,
+                        entry_price=entry_price,
+                        contracts=contracts,
+                        initial_sl=initial_sl,
+                        stop_size=stop_size,
+                        leverage=int(float(item.get("leverage", config.DEFAULT_LEVERAGE))),
+                        remaining=remaining,
+                        stops_passed=int(float(item.get("stops_passed", 0))),
+                        current_sl=float(item.get("current_sl", initial_sl)),
+                        current_tp=float(item.get("current_tp", 0)),
+                        entry_order_id=item.get("entry_order_id"),
+                        filled=bool(item.get("filled", False)),
+                        sl_triggered=False,
+                        tp_triggered=False,
+                        sl_price=float(item.get("sl_price", initial_sl)),
+                        trim_pct=float(item.get("trim_pct", 0)),
+                    )
+                    if plan.filled and plan.remaining <= 0:
+                        continue
+                    if plan.current_tp <= 0 and plan.stop_size > 0:
+                        if plan.side == "buy":
+                            plan.current_tp = round(plan.entry_price + 3 * plan.stop_size, 8)
+                        else:
+                            plan.current_tp = round(plan.entry_price - 3 * plan.stop_size, 8)
+                    self._plans[symbol] = plan
+                    self._leverage[symbol] = plan.leverage
+                    loaded += 1
+                except Exception as e:
+                    logger.error(f"Skipping broken plan in {PLANS_FILE}: {e}")
+
+            if loaded:
+                logger.info(f"Loaded {loaded} plans from {PLANS_FILE}")
+        except Exception as e:
+            logger.error(f"Failed to load plans from {PLANS_FILE}: {e}")
+
+    def _remove_plan(self, symbol: str, save: bool = True) -> Optional[Plan]:
+        plan = self._plans.pop(symbol, None)
+        if plan and save:
+            self._save_plans()
+        return plan
+
+    async def reconcile_restored_plans(self):
+        """
+        Сверить восстановленные планы с биржей.
+        Если бот падал после исполнения входа, но до обработки WS-fill,
+        план переводится в filled по реальной позиции.
+        """
+        if not self._plans:
+            return
+
+        changed = False
+        restored = 0
+
+        for symbol, plan in list(self._plans.items()):
+            try:
+                position = await self.client.get_position(symbol)
+            except Exception as e:
+                logger.warning(f"Could not reconcile restored plan {symbol}: {e}")
+                continue
+
+            qty = float(position.get("currentQty", 0)) if position else 0.0
+            real_qty = int(abs(qty))
+
+            if plan.filled:
+                if real_qty <= 0:
+                    logger.info(f"Restored plan {symbol} has no open position; removing")
+                    self._remove_plan(symbol, save=False)
+                    changed = True
+                    continue
+
+                real_side = "buy" if qty > 0 else "sell"
+                if real_side != plan.side:
+                    logger.warning(
+                        f"Restored plan {symbol} side mismatch: "
+                        f"plan={plan.side}, exchange={real_side}; removing plan"
+                    )
+                    await self._send(
+                        f"⚠️ *План `{symbol}` не восстановлен*\n"
+                        f"Сторона плана: `{plan.side}`, на бирже: `{real_side}`.\n"
+                        f"Сопровождение снято, чтобы не управлять чужой позицией."
+                    )
+                    self._remove_plan(symbol, save=False)
+                    changed = True
+                    continue
+
+                if plan.remaining != real_qty:
+                    logger.info(f"Restore sync {symbol}: remaining {plan.remaining} -> {real_qty}")
+                    plan.remaining = real_qty
+                    changed = True
+                plan.sl_triggered = False
+                plan.tp_triggered = False
+                self._leverage[symbol] = plan.leverage
+                restored += 1
+                continue
+
+            if real_qty <= 0:
+                self._leverage[symbol] = plan.leverage
+                continue
+
+            real_side = "buy" if qty > 0 else "sell"
+            if real_side != plan.side:
+                logger.warning(
+                    f"Pending restored plan {symbol} side mismatch: "
+                    f"plan={plan.side}, exchange={real_side}; keeping pending plan"
+                )
+                continue
+
+            fill_price = float(position.get("avgEntryPrice", 0) or 0)
+            if fill_price <= 0:
+                fill_price = plan.entry_price
+
+            plan.filled = True
+            plan.entry_price = fill_price
+            plan.stop_size = abs(fill_price - plan.initial_sl)
+            plan.remaining = real_qty
+            plan.current_sl = plan.initial_sl
+            if plan.side == "buy":
+                plan.current_tp = round(fill_price + 3 * plan.stop_size, 8)
+            else:
+                plan.current_tp = round(fill_price - 3 * plan.stop_size, 8)
+            plan.sl_triggered = False
+            plan.tp_triggered = False
+            self._leverage[symbol] = plan.leverage
+            changed = True
+            restored += 1
+
+            await self._send(
+                f"♻️ *План `{symbol}` восстановлен после рестарта*\n"
+                f"Цена входа: `{plan.entry_price}`\n"
+                f"Контрактов: `{plan.remaining}`\n"
+                f"SL: `{plan.current_sl}` | TP: `{plan.current_tp}`\n"
+                f"Stop size: `{plan.stop_size}`"
+            )
+
+        if changed:
+            self._save_plans()
+        if restored:
+            logger.info(f"Reconciled {restored} restored plans")
 
     async def _send(self, msg: str):
         try:
@@ -123,6 +323,7 @@ class OrderManager:
             sl_price=sl_price,
         )
         self._plans[symbol] = plan
+        self._save_plans()
         return plan
 
     # ── /stop — стоп-маркет на вход ──────────────────────────────────────────
@@ -133,7 +334,7 @@ class OrderManager:
 
         old = self._plans.get(symbol)
         if old:
-            self._plans.pop(symbol, None)
+            self._remove_plan(symbol)
 
         contracts, _, multiplier = await self.client.usdt_to_contracts(symbol, usdt_amount, price)
         actual_usdt = contracts * price * multiplier
@@ -168,7 +369,7 @@ class OrderManager:
 
         old = self._plans.get(symbol)
         if old:
-            self._plans.pop(symbol, None)
+            self._remove_plan(symbol)
 
         contracts, _, multiplier = await self.client.usdt_to_contracts(symbol, usdt_amount, price)
         actual_usdt = contracts * price * multiplier
@@ -199,7 +400,7 @@ class OrderManager:
 
         old = self._plans.get(symbol)
         if old:
-            self._plans.pop(symbol, None)
+            self._remove_plan(symbol)
 
         contracts, price, multiplier = await self.client.usdt_to_contracts(symbol, usdt_amount)
         actual_usdt = contracts * price * multiplier
@@ -238,6 +439,7 @@ class OrderManager:
             plan.current_tp = round(fill_price - 3 * plan.stop_size, 8)
 
         plan.current_sl = plan.initial_sl
+        self._save_plans()
 
         logger.info(f"Entry filled: {plan.symbol} {plan.side} @ {fill_price} "
                     f"SL={plan.current_sl} TP={plan.current_tp} "
@@ -295,7 +497,8 @@ class OrderManager:
 
         # ── Динамический трейлинг SL (активен после 2-го пореза) ─────────
         if plan.stops_passed >= 2:
-            self._update_trailing_sl(plan, price)
+            if self._update_trailing_sl(plan, price):
+                self._save_plans()
 
         # ── Проверяем SL ──────────────────────────────────────────────────
         sl_hit = False
@@ -321,16 +524,19 @@ class OrderManager:
             await self._execute_tp(plan, price)
             return
 
-    def _update_trailing_sl(self, plan: Plan, price: float):
+    def _update_trailing_sl(self, plan: Plan, price: float) -> bool:
         """Динамический трейлинг: SL следует за ценой на 1×stop, только в плюс."""
         if plan.side == "buy":
             new_sl = round(price - plan.stop_size, 8)
             if new_sl > plan.current_sl:
                 plan.current_sl = new_sl
+                return True
         else:
             new_sl = round(price + plan.stop_size, 8)
             if new_sl < plan.current_sl:
                 plan.current_sl = new_sl
+                return True
+        return False
 
     # ── Верификация закрытия позиции ────────────────────────────────────────
     async def _verify_position_closed(self, plan: Plan, reason: str) -> bool:
@@ -397,7 +603,7 @@ class OrderManager:
 
         # Верификация: убеждаемся что позиция реально закрыта
         await self._verify_position_closed(plan, "SL")
-        self._plans.pop(plan.symbol, None)
+        self._remove_plan(plan.symbol)
 
     # ── Исполнение TP через маркет ───────────────────────────────────────────
     async def _execute_tp(self, plan: Plan, price: float):
@@ -415,7 +621,7 @@ class OrderManager:
 
         # Верификация: убеждаемся что позиция реально закрыта
         await self._verify_position_closed(plan, "TP")
-        self._plans.pop(plan.symbol, None)
+        self._remove_plan(plan.symbol)
 
     # ═════════════════════════════════════════════════════════════════════════
     #  УРОВНИ ФЕН-ШУЙ
@@ -432,22 +638,24 @@ class OrderManager:
                     f"⚠️ *Позиция `{plan.symbol}` не найдена на бирже*\n"
                     f"Сопровождение остановлено."
                 )
-                self._plans.pop(plan.symbol, None)
+                self._remove_plan(plan.symbol)
                 return
 
             real_qty = abs(float(position.get("currentQty", 0)))
             if int(real_qty) != plan.remaining:
                 logger.info(f"Sync remaining: plan={plan.remaining} -> exchange={int(real_qty)}")
                 plan.remaining = int(real_qty)
+                self._save_plans()
 
             if plan.remaining <= 0:
-                self._plans.pop(plan.symbol, None)
+                self._remove_plan(plan.symbol)
                 return
 
         except Exception as e:
             logger.error(f"Position check failed: {e}")
 
         plan.stops_passed = level
+        self._save_plans()
         logger.info(f"Feng Shui level {level}: {plan.symbol} price={current_price} "
                     f"remaining={plan.remaining}")
 
@@ -467,6 +675,7 @@ class OrderManager:
             oid = await self._close_position_market(plan, cut, "Порез 1")
             if oid:
                 plan.remaining -= cut
+                self._save_plans()
             else:
                 return
 
@@ -483,7 +692,7 @@ class OrderManager:
 
         if plan.remaining <= 0:
             await self._send(f"🏁 Позиция `{plan.symbol}` закрыта полностью")
-            self._plans.pop(plan.symbol, None)
+            self._remove_plan(plan.symbol)
 
     # ── Уровень 2: Второй порез + старт трейлинга ────────────────────────────
     async def _level_2_second_cut(self, plan: Plan, current_price: float):
@@ -504,6 +713,7 @@ class OrderManager:
         else:
             plan.current_sl = round(plan.entry_price - plan.stop_size, 8)
         # TP здесь не меняется — углубление начнётся с уровня 3+
+        self._save_plans()
 
         await self._send(
             f"✂️ *Уровень 2 — Второй порез + старт трейлинга*\n"
@@ -517,7 +727,7 @@ class OrderManager:
 
         if plan.remaining <= 0:
             await self._send(f"🏁 Позиция `{plan.symbol}` закрыта полностью")
-            self._plans.pop(plan.symbol, None)
+            self._remove_plan(plan.symbol)
 
     # ── Уровень 3+: Углубление TP (SL трейлится в on_price_update) ───────────
     async def _level_n_trail(self, plan: Plan, level: int, current_price: float):
@@ -525,6 +735,7 @@ class OrderManager:
             plan.current_tp = round(plan.current_tp + plan.stop_size, 8)
         else:
             plan.current_tp = round(plan.current_tp - plan.stop_size, 8)
+        self._save_plans()
 
         await self._send(
             f"📐 *Уровень {level} — Углубление TP*\n"
@@ -569,6 +780,10 @@ class OrderManager:
         plan = self._plans.get(symbol)
         if plan:
             plan.remaining = max(0, plan.remaining - close_n)
+            if plan.remaining <= 0:
+                self._remove_plan(symbol)
+            else:
+                self._save_plans()
 
         logger.info(f"Partial close: {symbol} {close_pct}% -> {close_n}/{int(current_qty)}c")
         usdt_str = f" (~`{close_usdt:.2f} USDT`)" if close_usdt else ""
@@ -645,7 +860,7 @@ class OrderManager:
             f"🛑 *Стоп сработал*\n"
             f"Символ: `{symbol}`\nЗакрыто: `{size}` контрактов"
         )
-        self._plans.pop(symbol, None)
+        self._remove_plan(symbol)
 
     async def on_position_opened(self, data: dict):
         symbol = data.get("symbol", "")
@@ -676,7 +891,7 @@ class OrderManager:
     async def cancel_all(self, symbol: str) -> bool:
         try:
             await self.client.cancel_all_orders(symbol)
-            self._plans.pop(symbol, None)
+            self._remove_plan(symbol)
             await self._send(f"🗑 Все ордера по `{symbol}` отменены")
             return True
         except Exception as e:

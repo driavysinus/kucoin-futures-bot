@@ -36,3 +36,5 @@ Thumbs.db
 
 # Alert files
 alerts.json
+plans.json
+plans.json.tmp

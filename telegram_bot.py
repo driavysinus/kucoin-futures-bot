@@ -719,12 +719,16 @@ class TradingBot:
                                              parse_mode=ParseMode.MARKDOWN)
             return
 
-        lines = [f"*🔔 Активные алерты ({len(alerts)}):*\n"]
+        header = f"*🔔 Активные алерты ({len(alerts)}):*\n"
+        chunks = []
+        current = [header]
+        max_len = 3500  # Telegram limit is 4096; keep margin for Markdown.
+
         for a in alerts:
             direction = "📉 падение до" if a.direction == "down" else "📈 рост до"
 
             if a.alert_type == "notify":
-                lines.append(
+                item = (
                     f"*#{a.id}* `{a.symbol}` 🔔 УВЕДОМЛЕНИЕ\n"
                     f"  {direction} `{a.trigger_price}`\n"
                 )
@@ -732,14 +736,26 @@ class TradingBot:
                 stop_size = abs(a.trigger_price - a.sl_price) if a.sl_price > 0 else 0
                 sl_str = f" | SL: `{a.sl_price}`" if a.sl_price > 0 else ""
                 stop_str = f" | Stop: `{stop_size}`" if stop_size > 0 else ""
-                lines.append(
+                item = (
                     f"*#{a.id}* `{a.symbol}` {a.side.upper()}\n"
                     f"  {direction} `{a.trigger_price}`{sl_str}{stop_str}\n"
                     f"  Объём: `{a.usdt_amount} USDT` | Плечо: `{a.leverage}x`\n"
                 )
-        await update.message.reply_text(
-            "\n".join(lines), parse_mode=ParseMode.MARKDOWN
-        )
+
+            candidate = "\n".join(current + [item])
+            if len(candidate) > max_len and len(current) > 1:
+                chunks.append("\n".join(current))
+                current = ["*🔔 Активные алерты, продолжение:*\n", item]
+            else:
+                current.append(item)
+
+        if current:
+            chunks.append("\n".join(current))
+
+        for chunk in chunks:
+            await update.message.reply_text(
+                chunk, parse_mode=ParseMode.MARKDOWN
+            )
 
     # ── ATR (Average True Range) ─────────────────────────────────────────────
     @restricted
@@ -910,6 +926,10 @@ class TradingBot:
         await app.start()
         await app.updater.start_polling(drop_pending_updates=True)
         logger.info("Telegram bot started")
+
+        await self.manager.reconcile_restored_plans()
+        for symbol in self.manager.get_plan_symbols():
+            self.monitor.subscribe_ticker(symbol)
 
         try:
             await self.monitor.start()
